@@ -26,5 +26,6 @@ done
 
 mkdir /var/log/motion
 touch /var/log/motion/motion.log
+chown motion:motion /var/log/motion/motion.log
 
 echo done prepping
