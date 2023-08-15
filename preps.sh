@@ -24,4 +24,7 @@ for i in "${groups[@]}"; do
     fi
 done
 
+mkdir /var/log/motion
+touch /var/log/motion/motion.log
+
 echo done prepping
