@@ -1,6 +1,6 @@
 #!/bin/bash
 
-user=$(whoami)
+user=$(logname)
 groups=( mail video motion )
 programs=( msmtp-mta mutt fswebcam zip mail motion mailutils)
 
@@ -23,6 +23,10 @@ for i in "${groups[@]}"; do
         sudo adduser $user $i
     fi
 done
+
+mkdir /home/$user/homeSec/motion
+chown jack:motion /home/$user/homeSec/motion
+chmod 775 /home/$user/homeSec/motion
 
 mkdir /var/log/motion
 touch /var/log/motion/motion.log
