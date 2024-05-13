@@ -25,7 +25,7 @@ for i in "${groups[@]}"; do
 done
 
 mkdir /home/$user/homeSec/motion
-chown jack:motion /home/$user/homeSec/motion
+chown $user:motion /home/$user/homeSec/motion
 chmod 775 /home/$user/homeSec/motion
 
 mkdir /var/log/motion
