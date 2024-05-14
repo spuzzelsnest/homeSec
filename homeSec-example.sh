@@ -1,8 +1,8 @@
 #!/bin/bash
 
 user=$(whoami)
-dump='/home/'$user'/Pictures/homeSec'
-zips='/home/'$user'/Pictures/sendFiles'
+dump='motion/'
+zips='sendFiles/'
 date=$(date +"%Y-%m-%d_%H%M")
 email= <! email address !>
 mkdir -p $dump
