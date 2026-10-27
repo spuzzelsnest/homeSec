@@ -1,0 +1,37 @@
+[Unit]
+Description=homeSec - mail webcam pictures saved by motion
+Documentation=https://github.com/spuzzelsnest/homeSec
+After=network-online.target motion.service
+Wants=network-online.target motion.service
+
+[Service]
+Type=simple
+User=motion
+Group=motion
+EnvironmentFile=/etc/homesec/homesec.env
+Environment=HOME=/var/lib/homesec
+ExecStart=/usr/local/bin/homesec watch
+
+# /var/lib/homesec (IMAGE_DIR) is created and owned by the motion user.
+# If you change IMAGE_DIR, add its path to ReadWritePaths=.
+StateDirectory=homesec
+StateDirectoryMode=0775
+
+# Keep running if the mail server is down; but not when the settings are wrong (exit 78).
+Restart=always
+RestartSec=10
+RestartPreventExitStatus=78
+
+# Hardening
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+LockPersonality=yes
+
+[Install]
+WantedBy=multi-user.target
