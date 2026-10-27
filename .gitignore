@@ -1,8 +1,5 @@
 .gitignore
 
-homeSec.sh
-sendMail.sh
-
 #Directories
 motion/*
 sendFiles/
