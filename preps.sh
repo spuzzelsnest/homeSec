@@ -2,7 +2,7 @@
 #
 # Prepare a Raspberry Pi (Raspberry Pi OS / Debian) for homeSec.
 # Run as your normal user (not with sudo); sudo is asked for where needed.
-# Safe to run again: it also installs the latest homeSec.sh.
+# Safe to run again: it also installs the latest script and service file.
 
 set -euo pipefail
 
@@ -14,9 +14,10 @@ if [[ $EUID -eq 0 ]]; then
 fi
 user=$(id -un)
 
-packages=(msmtp-mta mutt fswebcam motion)
+packages=(msmtp-mta mutt fswebcam motion inotify-tools)
 groups=(video motion)
 image_dir=/var/lib/homesec
+env_file=/etc/homesec/homesec.env
 
 echo "== Installing packages =="
 missing=()
@@ -44,21 +45,28 @@ echo "== Installing homeSec =="
 sudo install -m 0755 "$SCRIPT_DIR/homeSec.sh" /usr/local/bin/homesec
 
 # Pictures live outside /home so the motion service can always reach them.
-sudo install -d -m 2775 -o motion -g motion "$image_dir"
+sudo install -d -m 0775 -o motion -g motion "$image_dir"
 sudo install -d -m 0755 -o motion -g motion /var/log/motion
 
-if [[ -e /etc/homesec.conf ]]; then
-    echo "/etc/homesec.conf already exists, leaving it alone."
+sudo install -d -m 0750 -o root -g motion /etc/homesec
+if [[ -e $env_file ]]; then
+    echo "$env_file already exists, leaving it alone."
 else
-    sudo install -m 0640 -o root -g motion "$SCRIPT_DIR/homesec.conf.example" /etc/homesec.conf
-    echo "Created /etc/homesec.conf"
+    sudo install -m 0640 -o root -g motion "$SCRIPT_DIR/homesec.env.example" "$env_file"
+    echo "Created $env_file"
 fi
+
+echo "== Installing service =="
+sudo install -m 0644 "$SCRIPT_DIR/homesec.service" /etc/systemd/system/homesec.service
+sudo systemctl daemon-reload
+sudo systemctl enable homesec.service
 
 cat <<EOF
 
-Done. Next steps (see README.md):
-  1. sudoedit /etc/homesec.conf          # set EMAIL
-  2. configure /etc/msmtprc              # SMTP account
-  3. configure /etc/motion/motion.conf   # on_picture_save hook
-  4. sudo -u motion homesec --test       # check that a mail arrives
+Done. The service is enabled but NOT started yet. Next steps (see README.md):
+  1. sudoedit $env_file                # set EMAIL
+  2. configure /etc/msmtprc            # SMTP account
+  3. configure /etc/motion/motion.conf # save pictures to $image_dir
+  4. sudo -u motion homesec --test     # check that a mail arrives
+  5. sudo systemctl enable --now motion homesec
 EOF
