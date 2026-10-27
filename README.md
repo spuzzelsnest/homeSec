@@ -1,102 +1,124 @@
 # homeSec
 
-homeSec is a Raspberry Pi App where a connected webcam sends a picture on command to an email address when motion is detected.
+homeSec is a small Raspberry Pi app: a USB webcam watched by [motion](https://motion-project.github.io/) sends you a picture by e-mail when it detects movement.
 
-## Get Started
-### Installing
+Tested design target: Raspberry Pi 4B, Raspberry Pi OS (Debian based, 64-bit recommended), USB webcam.
+Pi Camera Modules (CSI) are not covered here; they need `rpicam`/libcamera instead of `fswebcam`.
 
-Run the preperation file first. This will install msmtp-mta - mutt - fswebcam - zip - mail - motion which are needed for the program to run. 
-This will add the additional software and add the user to the necessary groups. It will ask for sudo passwords where needed.
+## How it works
 
 ```
+webcam --> motion (detects movement, saves a jpg)
+                 |  on_picture_save
+                 v
+           homesec (cooldown, mail, cleanup)
+                 |
+                 v
+        mutt --> msmtp --> your SMTP server --> inbox
+```
+
+motion keeps the webcam open, so homesec uses the picture motion already saved instead of opening the camera a second time.
+
+## Install
+
+```
+git clone https://github.com/spuzzelsnest/homeSec.git
+cd homeSec
 ./preps.sh
 ```
 
-### MSMTP config
+`preps.sh` installs `msmtp-mta mutt fswebcam motion`, adds your user to the `video` and `motion` groups, installs the script as `/usr/local/bin/homesec`, creates `/var/lib/homesec` for pictures and creates `/etc/homesec.conf`. Run it again after updating the repo to install the new script version.
 
-msmtp is used for sending emails. Make sure this config file is in the home directory of the user who will be sending the emails.
-
-** if you are using a G Mail Account without OAUTH2, make sure "Less secure apps" is enabled for the account. Google reported that the option to send over "Less Secure Apps" will be deprecated in Feb 2020!
-
+Then set your address:
 
 ```
-#~/.msmtprc
+sudoedit /etc/homesec.conf      # EMAIL="you@example.com"
+```
 
-# Set default values for all following accounts.
+## E-mail (msmtp)
 
+motion runs as the system user `motion`, so it cannot read a `~/.msmtprc` in your home directory. Use the system-wide config `/etc/msmtprc` instead:
+
+```
+# /etc/msmtprc
 defaults
+auth            on
 tls             on
-tls_starttls	on
+tls_starttls    on
 tls_trust_file  /etc/ssl/certs/ca-certificates.crt
-logfile         ~/.msmtp.log
+syslog          on
 
-account gmail
-host 		smtp.gmail.com
-from 		<user>@gmail.com
-auth 		on
-user 		<user>
-passwordeval gpg -d ~/.msmtp-gmail.gpg
+account         gmail
+host            smtp.gmail.com
+port            587
+from            you@gmail.com
+user            you@gmail.com
+passwordeval    cat /etc/msmtp-password
 
-# Set a default account
 account default : gmail
-
 ```
 
-Set the right permissions for the file:
+Store the SMTP password in a file only root and the motion group can read:
 
 ```
-chmod 600 .msmtprc
+sudo install -m 0640 -o root -g motion /dev/null /etc/msmtp-password
+sudoedit /etc/msmtp-password     # put the password on the only line
 ```
 
-To encrypt your account password you can use GPG to encrypt it.
+**Gmail:** the old "Less secure apps" option no longer exists. Turn on 2-step verification and create an
+[app password](https://myaccount.google.com/apppasswords), or use another SMTP provider. Google changes these rules from time to time, so check their current documentation.
 
-If you haven't used GPG before you first need to run the following:
-
-```
-gpg --gen-key
-```
-create a file with the plain text password.
+Send a test mail through the same path motion will use:
 
 ```
-echo "MY SUPER SECRET GMAIL PASS" > plaintext.txt
+sudo -u motion homesec --test
 ```
 
-Use next command to encrypt the file. Use the email address you used to create the account here.
+It takes a picture with the webcam and mails it. If it fails, read `journalctl -t msmtp` and the messages homesec prints.
+
+## motion
+
+Edit `/etc/motion/motion.conf` and set (or add):
 
 ```
-gpg --encrypt -o .msmtp-gmail.gpg -r <user>@gmail.com plaintext.txt
+video_device /dev/video0
+width 1280
+height 720
+framerate 5
+movie_output off
+picture_output first
+target_dir /var/lib/homesec
+picture_filename %Y-%m-%d_%H%M%S-%v
+on_picture_save /usr/local/bin/homesec %f
 ```
-Remove your plain text password file!! Also be aware that if you added the pass with echo, it is still in your .[shell]_history!
-```
-rm plaintext.txt
-```
-Best practice is to reboot after this.
-```
-sudo reboot
-```
-After the reboot you can check if the sending email from the command line is working by issuing the following command.
-```
-echo "This is the test message" | mutt -s "Testing mutt" <RECIPIENT EMAILL> 
-```
-If errors should come up, make sure gpg is properly connecting.
-```
-export GPG_TTY=$(tty)
-```
-## Running the App
 
-Run the program with the following command
+- `picture_output first` saves one picture per motion event, `%f` hands that file to homesec.
+- A low `framerate` keeps CPU load down on the Pi.
+- Option names are for motion 4.x; if your version complains about one, check `man motion`.
+
+Then start it:
 
 ```
-./homeSec
+sudo systemctl enable --now motion
+sudo systemctl status motion
 ```
-It will ask you for you e-mail address to send the test file.
 
-## Customisable Options
+## Settings (`/etc/homesec.conf`)
 
-In motion.sh change line 7 to add an email address to send the homesecurity files to.
-If you want to use the motion option, add 'motion.sh' to the /etc/motion/motion.conf file in the section:
+| Setting | Default | Meaning |
+|---|---|---|
+| `EMAIL` | none | Recipient (required) |
+| `MAIL_FROM` | empty | Optional From address |
+| `SUBJECT` | `Motion detected` | Mail subject |
+| `IMAGE_DIR` | `/var/lib/homesec` | Pictures; same folder as motion's `target_dir` |
+| `COOLDOWN` | `300` | Minimum seconds between two mails |
+| `KEEP_DAYS` | `7` | Pictures older than this are deleted |
+| `VIDEO_DEVICE`, `RESOLUTION`, `SKIP_FRAMES` | `/dev/video0`, `1280x720`, `10` | Only used when homesec takes the picture itself |
 
-```
-# Command to be executed when a motion frame is detected (default: none)
- on_motion_detected /bin/bash /[DIR LOCATIOON]/motion.sh
-```
+## Troubleshooting
+
+- **"Device or resource busy"**: something else (usually motion) has the webcam open. Let motion take the picture; don't run `fswebcam` while motion runs.
+- **No mail, no error**: run `sudo -u motion homesec --test` and `journalctl -u motion -e`.
+- **Permission denied on the webcam**: `video` group membership needs a re-login (or reboot).
+- **Too many mails**: raise `COOLDOWN`.
+- **No mail after a reboot**: `systemctl is-enabled motion`.
