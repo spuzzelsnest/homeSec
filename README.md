@@ -1,127 +1,83 @@
 # homeSec
 
-homeSec is a small Raspberry Pi service: a USB webcam watched by [motion](https://motion-project.github.io/) saves a picture when it sees movement, and homeSec mails it to you.
+homeSec is a small Raspberry Pi service: a camera watches a room, and when something moves homeSec mails you a picture.
 
-Design target: Raspberry Pi 4B, Raspberry Pi OS (Debian based, 64-bit recommended), USB webcam.
-Pi Camera Modules (CSI) are not covered here; they need `rpicam`/libcamera instead of `fswebcam`.
+It is one Python file (`homesec.py`) with no extra software: the camera is read with [picamera2](https://github.com/raspberrypi/picamera2), movement is detected with numpy, and mail is sent with Python's `smtplib`. Earlier versions needed `motion`, `fswebcam`, `mutt`, `msmtp` and `inotify-tools`; those are gone.
 
-## How it works
+Target: Raspberry Pi 4B with Raspberry Pi OS (Debian based, 64-bit recommended) and a Raspberry Pi camera on the ribbon cable (for example the HQ camera). USB webcams work too (`--usb`, see below).
 
 ```
-webcam --> motion.service            (detects movement, saves jpg to /var/lib/homesec)
-                 |
-                 v
-           homesec.service           (watches the folder: cooldown, mail, cleanup)
-                 |
-                 v
-        mutt --> msmtp --> your SMTP server --> inbox
+camera --> homesec.service --> detects movement --> saves jpg --> e-mail (SMTP) --> inbox
 ```
 
-The two services are independent: motion only saves pictures, homesec only mails them. Settings live in one env file, `/etc/homesec/homesec.env`.
+How detection works: the camera delivers a small grey picture (320x240, 5 per second). When the picture changes a lot between two frames, several frames in a row, that counts as movement. Slow changes such as daylight are ignored. After a mail, nothing is sent for `COOLDOWN` seconds (5 minutes by default).
 
 ## Install
 
 ```
 git clone https://github.com/spuzzelsnest/homeSec.git
 cd homeSec
-./preps.sh
+./preps.sh            # add --usb for a USB webcam
 ```
 
-`preps.sh` installs `msmtp-mta mutt fswebcam motion inotify-tools`, adds your user to the `video` and `motion` groups, installs the script as `/usr/local/bin/homesec`, creates `/var/lib/homesec` for pictures, `/etc/homesec/homesec.env` for settings and the `homesec.service` unit (enabled, not started). Run it again after updating the repo to install the new versions; your env file is left alone.
+`preps.sh` installs `python3-picamera2` and `python3-numpy` with apt, creates a `homesec` service user (member of `video`), installs the program as `/usr/local/bin/homesec`, creates `/etc/homesec/homesec.env` and installs and enables `homesec.service`. Run it again after updating the repo; your settings are left alone. If `motion` is installed it is disabled, because it would keep the camera busy.
 
-## Settings (`/etc/homesec/homesec.env`)
-
-```
-sudoedit /etc/homesec/homesec.env      # EMAIL="you@example.com"
-```
-
-| Setting | Default | Meaning |
-|---|---|---|
-| `EMAIL` | none | Recipient (required) |
-| `MAIL_FROM` | empty | Optional From address |
-| `SUBJECT` | `Motion detected` | Mail subject |
-| `IMAGE_DIR` | `/var/lib/homesec` | Pictures; same folder as motion's `target_dir` |
-| `COOLDOWN` | `300` | Minimum seconds between two mails |
-| `KEEP_DAYS` | `7` | Pictures older than this are deleted |
-| `VIDEO_DEVICE`, `RESOLUTION`, `SKIP_FRAMES` | `/dev/video0`, `1280x720`, `10` | Only used by `homesec --test` |
-
-The file is plain `KEY=value` lines, read by systemd and by the script. For development you can keep a `.env` next to `homeSec.sh` (it is git-ignored) or point `HOMESEC_ENV` at any file. After editing the env file: `sudo systemctl restart homesec`.
-
-## E-mail (msmtp)
-
-The services run as the system user `motion`, so a `~/.msmtprc` in your home directory is not used. Use the system-wide config `/etc/msmtprc`:
+## Settings
 
 ```
-# /etc/msmtprc
-defaults
-auth            on
-tls             on
-tls_starttls    on
-tls_trust_file  /etc/ssl/certs/ca-certificates.crt
-syslog          on
-
-account         gmail
-host            smtp.gmail.com
-port            587
-from            you@gmail.com
-user            you@gmail.com
-passwordeval    cat /etc/msmtp-password
-
-account default : gmail
+sudoedit /etc/homesec/homesec.env
 ```
 
-Store the SMTP password in a file only root and the motion group can read:
+At least `MAIL_TO`, `SMTP_HOST`, `SMTP_USER` and `SMTP_PASSWORD`. All settings are explained in [`homesec.env.example`](homesec.env.example). After editing: `sudo systemctl restart homesec`.
 
-```
-sudo install -m 0640 -o root -g motion /dev/null /etc/msmtp-password
-sudoedit /etc/msmtp-password     # put the password on the only line
-```
+**Gmail:** the old "Less secure apps" option no longer exists. Turn on 2-step verification and create an [app password](https://myaccount.google.com/apppasswords), then use `smtp.gmail.com`, your address as `SMTP_USER` and the app password as `SMTP_PASSWORD`. Any other SMTP provider works the same way. Google changes these rules from time to time, so check their current documentation.
 
-**Gmail:** the old "Less secure apps" option no longer exists. Turn on 2-step verification and create an
-[app password](https://myaccount.google.com/apppasswords), or use another SMTP provider. Google changes these rules from time to time, so check their current documentation.
+Connections are encrypted (`starttls` on port 587, or `ssl` on 465) and the server certificate is checked.
 
-Send a test mail through the same path the service uses:
+## Test, step by step
 
-```
-sudo -u motion homesec --test
-```
+1. Camera seen? `rpicam-hello --list-cameras` must list it. If it says "No cameras available", power off, reseat the ribbon cable (contacts towards the HDMI ports on a Pi 4B) and check `camera_auto_detect=1` in `/boot/firmware/config.txt`.
+2. Mail works? `sudo -u homesec homesec mailtest` sends a test mail, no camera needed.
+3. Camera + mail work? `sudo -u homesec homesec snapshot` takes a picture and mails it. Stop the service first (`sudo systemctl stop homesec`); only one program can use the camera.
+4. Start it: `sudo systemctl start homesec`, watch the log with `journalctl -u homesec -f` and walk in front of the camera.
 
-It takes a picture with the webcam and mails it (stop motion first: `sudo systemctl stop motion`, because motion keeps the webcam open).
+## Commands
 
-## motion
+| Command | What it does |
+|---|---|
+| `homesec run` | Watch and mail (this is what the service runs) |
+| `homesec snapshot` | Take one picture now and mail it |
+| `homesec mailtest` | Send a test mail |
 
-Edit `/etc/motion/motion.conf` and set (or add). There is no hook script any more; motion only saves pictures:
+Options: `--env FILE` uses another settings file, `-v` shows debug messages (including ignored movement, useful for tuning `THRESHOLD`). Exit code 78 means a setting is wrong; the service then stops instead of retrying.
 
-```
-video_device /dev/video0
-width 1280
-height 720
-framerate 5
-movie_output off
-picture_output first
-target_dir /var/lib/homesec
-picture_filename %Y-%m-%d_%H%M%S-%v
-```
+## Tuning
 
-- `picture_output first` saves one picture per motion event.
-- A low `framerate` keeps CPU load down on the Pi.
-- Option names are for motion 4.x; if your version complains about one, check `man motion`.
+- **False alarms** (light changes, curtains, insects at night): raise `THRESHOLD` (default 7) or `FRAMES`.
+- **Movement is missed**: lower `THRESHOLD` (try 4), or raise `FPS`.
+- **Too many mails**: raise `COOLDOWN`.
+- Run `sudo -u homesec homesec run -v` in a terminal to see the score of every ignored movement.
 
-## Run it as a service
+## USB webcam
 
-```
-sudo systemctl enable --now motion homesec
-systemctl status homesec
-journalctl -u homesec -f          # live log
-```
+Run `./preps.sh --usb` (installs `python3-opencv`) and set `CAMERA="opencv"`, optionally `VIDEO_DEVICE="/dev/video0"`, in the settings file. With `CAMERA="auto"` a USB webcam is used when no Pi camera is found. The Pi camera path is the one developed for this project; the USB path is basic.
 
-Both start at boot. Pictures that were saved while homesec was not running are not mailed afterwards.
+## Updating from the older version (motion + fswebcam + msmtp)
+
+Run `./preps.sh`. It stops the old service, disables `motion`, gives the service user ownership of `/var/lib/homesec` and keeps your `/etc/homesec/homesec.env`. That file needs the new mail settings (`SMTP_HOST`, `SMTP_USER`, `SMTP_PASSWORD`; `EMAIL` still works as `MAIL_TO`). Afterwards you can remove the old software, the installer prints the commands.
 
 ## Troubleshooting
 
-- **homesec won't start, "EMAIL is not set"**: edit `/etc/homesec/homesec.env`, then `sudo systemctl restart homesec` (the unit deliberately does not retry on a settings error).
-- **"Device or resource busy"**: something else (usually motion) has the webcam open. Only `homesec --test` uses the camera itself, so stop motion first.
-- **No mail, no error**: `journalctl -u homesec -e` and `journalctl -t msmtp -e`; try `sudo -u motion homesec --test`.
-- **Permission denied on the webcam**: `video` group membership needs a re-login (or reboot).
-- **Too many mails**: raise `COOLDOWN`.
-- **Different `IMAGE_DIR`**: also add it to `ReadWritePaths=` in `/etc/systemd/system/homesec.service` (`sudo systemctl edit homesec` works too), then `sudo systemctl daemon-reload && sudo systemctl restart homesec`.
+- **`settings: ...` and the service does not start**: fix `/etc/homesec/homesec.env`, then `sudo systemctl restart homesec`.
+- **"cannot open the camera ... busy"**: another program uses it. `sudo systemctl stop homesec` before `snapshot`, and make sure `motion` is disabled (`systemctl is-enabled motion`).
+- **No mail**: `journalctl -u homesec -e`. Failed mails are retried twice; the picture stays in `/var/lib/homesec`.
+- **Permission denied reading settings**: run commands as the service user: `sudo -u homesec homesec ...`.
+- **A different `IMAGE_DIR`**: also add it to `ReadWritePaths=` in the service file (`sudo systemctl edit homesec`), then `sudo systemctl daemon-reload && sudo systemctl restart homesec`.
+
+## Development
+
+```
+python3 -m unittest discover -s tests -v
+```
+
+The tests use a fake camera, a fake `picamera2` module and a mocked mail server, so they run on any computer with Python and numpy. They do not replace a test with the real camera.
