@@ -5,6 +5,7 @@ Commands:
   homesec run        watch the camera and mail a picture on movement (the service)
   homesec snapshot   take one picture now and mail it (stop the service first)
   homesec mailtest   send a test mail without using the camera
+  homesec slacktest  post a test message to Slack
 
 Settings are read from the first of these files that exists:
   --env FILE, $HOMESEC_ENV, ./.env, /etc/homesec/homesec.env
@@ -16,9 +17,16 @@ Needs only the Raspberry Pi OS packages python3-picamera2 and python3-numpy
 from __future__ import annotations
 
 import argparse
+import errno
+import io
+import ipaddress
+import json
 import logging
+import mimetypes
 import os
 import queue
+import re
+import select
 import signal
 import smtplib
 import socket
@@ -26,12 +34,16 @@ import ssl
 import sys
 import threading
 import time
-from dataclasses import dataclass
+import urllib.error
+import urllib.request
+from dataclasses import dataclass, field
 from datetime import datetime
 from email.message import EmailMessage
 from email.utils import formatdate, make_msgid
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Callable, Mapping, Optional
+from urllib.parse import parse_qs, urlparse
 
 import numpy as np
 
@@ -39,6 +51,14 @@ log = logging.getLogger("homesec")
 
 EX_CONFIG = 78  # the systemd unit does not restart the service on this exit code
 DEFAULT_ENV_FILE = "/etc/homesec/homesec.env"
+STATIC_NAME = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.-]{0,63}$")  # one file name, no folders
+MAX_VIEWERS = 4  # live views at the same time; every one costs the Pi a JPEG encode per frame
+
+
+def default_static_dir() -> Path:
+    """The web console files: the "static" folder next to this file, or where preps.sh installs them."""
+    here = Path(__file__).resolve().parent / "static"
+    return here if here.is_dir() else Path("/usr/local/share/homesec/static")
 
 
 class ConfigError(Exception):
@@ -146,7 +166,7 @@ class Config:
     smtp_host: str
     smtp_port: int
     smtp_user: str
-    smtp_password: str
+    smtp_password: str = field(repr=False)  # secrets stay out of repr(), so they cannot end up in a log
     smtp_security: str
     smtp_timeout: int
     image_dir: Path
@@ -155,12 +175,20 @@ class Config:
     resolution: tuple
     detect_size: tuple
     fps: float
+    buffer_count: int
     threshold: float
     frames: int
     warmup: float
     cooldown: float
     keep_days: int
     jpeg_quality: int
+    web_host: str
+    web_port: int
+    web_url: str
+    web_allowed_hosts: tuple
+    static_dir: Path
+    slack_webhook: str = field(repr=False)
+    slack_channel: str
     log_level: str
 
     @classmethod
@@ -189,6 +217,18 @@ class Config:
         if detect_size[0] > resolution[0] or detect_size[1] > resolution[1]:
             raise ConfigError("DETECT_SIZE must not be larger than RESOLUTION")
 
+        slack_webhook = r.text("SLACK_WEBHOOK_URL")
+        slack_channel = r.text("SLACK_CHANNEL")
+        if slack_webhook and not slack_webhook.startswith("https://"):
+            raise ConfigError("SLACK_WEBHOOK_URL must start with https://")
+        if slack_channel and not slack_webhook:
+            raise ConfigError("SLACK_CHANNEL is set but SLACK_WEBHOOK_URL is not")
+        web_url = r.text("WEB_URL").rstrip("/")
+        if web_url and not web_url.startswith(("http://", "https://")):
+            raise ConfigError("WEB_URL must start with http:// or https://")
+        allowed_hosts = tuple(h.strip().lower() for h in r.text("WEB_ALLOWED_HOSTS").split(",") if h.strip())
+        static_dir = Path(r.text("STATIC_DIR")) if r.text("STATIC_DIR") else default_static_dir()
+
         return cls(
             mail_to=recipients,
             mail_from=mail_from,
@@ -205,12 +245,20 @@ class Config:
             resolution=resolution,
             detect_size=detect_size,
             fps=r.number("FPS", 5.0, float, 0.5, 30),
+            buffer_count=r.number("BUFFER_COUNT", 3, int, 2, 12),
             threshold=r.number("THRESHOLD", 7.0, float, 0, 65025),
             frames=r.number("FRAMES", 2, int, 1, 100),
             warmup=r.number("WARMUP", 5.0, float, 0, 600),
             cooldown=r.number("COOLDOWN", 300.0, float, 1, 86400),
             keep_days=r.number("KEEP_DAYS", 7, int, 1, 3650),
             jpeg_quality=r.number("JPEG_QUALITY", 90, int, 10, 100),
+            web_host=r.text("WEB_HOST", "0.0.0.0"),
+            web_port=r.number("WEB_PORT", 8080, int, 0, 65535),  # 0 = no web page
+            web_url=web_url,
+            web_allowed_hosts=allowed_hosts,
+            static_dir=static_dir,
+            slack_webhook=slack_webhook,
+            slack_channel=slack_channel,
             log_level=r.choice("LOG_LEVEL", "info", ("debug", "info", "warning", "error")),
         )
 
@@ -251,53 +299,150 @@ def send_message(cfg: Config, msg: EmailMessage) -> None:
         server.send_message(msg)
 
 
-class Mailer:
-    """Sends pictures from a background thread so a slow mail server never blocks detection."""
+class _RetryWorker:
+    """Delivers items from a background thread, with retries, so a slow server never blocks detection."""
 
+    NAME = "worker"
     ATTEMPTS = 3
     RETRY_DELAYS = (10, 60)  # seconds before attempt 2 and 3
 
-    def __init__(self, cfg: Config, sender: Callable = send_message):
+    def __init__(self, cfg: Config, sender: Callable):
         self._cfg = cfg
         self._send = sender
         self._queue: queue.Queue = queue.Queue()
         self._stopping = threading.Event()
-        self._thread = threading.Thread(target=self._work, name="mailer", daemon=True)
+        self._thread = threading.Thread(target=self._work, name=self.NAME, daemon=True)
 
     def start(self) -> None:
         self._thread.start()
 
-    def submit(self, image: Path) -> None:
-        self._queue.put(image)
+    def submit(self, item) -> None:
+        self._queue.put(item)
 
     def close(self, timeout: float = 30) -> None:
-        """Finish the mail in progress (without waiting for retries) and stop."""
+        """Finish the delivery in progress (without waiting for retries) and stop."""
         self._stopping.set()
         self._queue.put(None)
         self._thread.join(timeout)
 
     def _work(self) -> None:
         while True:
-            image = self._queue.get()
-            if image is None:
+            item = self._queue.get()
+            if item is None:
                 return
-            self.deliver(image)
+            self.deliver(item)
 
-    def deliver(self, image: Path) -> bool:
+    def deliver(self, item) -> bool:
         for attempt in range(1, self.ATTEMPTS + 1):
             try:
-                self._send(self._cfg, build_message(self._cfg, image))
-                log.info("mailed %s to %s", image.name, ", ".join(self._cfg.mail_to))
+                self._deliver_once(item)
                 return True
             except OSError as exc:
-                log.error("mail attempt %d/%d failed: %s", attempt, self.ATTEMPTS, exc)
+                log.error("%s attempt %d/%d failed: %s", self.NAME, attempt, self.ATTEMPTS, exc)
             if attempt < self.ATTEMPTS and self._stopping.wait(self.RETRY_DELAYS[attempt - 1]):
                 break
-        log.error("giving up on %s (the picture stays in %s)", image.name, self._cfg.image_dir)
+        log.error("giving up on %s", self._describe(item))
         return False
+
+    def _deliver_once(self, item) -> None:
+        raise NotImplementedError
+
+    def _describe(self, item) -> str:
+        return str(item)
+
+
+class Mailer(_RetryWorker):
+    """Mails pictures."""
+
+    NAME = "mail"
+
+    def __init__(self, cfg: Config, sender: Callable = send_message):
+        super().__init__(cfg, sender)
+
+    def _deliver_once(self, image: Path) -> None:
+        self._send(self._cfg, build_message(self._cfg, image))
+        log.info("mailed %s to %s", image.name, ", ".join(self._cfg.mail_to))
+
+    def _describe(self, image: Path) -> str:
+        return f"{image.name} (the picture stays in {self._cfg.image_dir})"
+
+
+# ---------------------------------------------------------------------------- slack
+
+
+class SlackError(OSError):
+    """Slack refused the message."""
+
+
+def _slack_post(url: str, payload: dict, timeout: float = 10) -> None:
+    request = urllib.request.Request(url, data=json.dumps(payload).encode(),
+                                     headers={"Content-Type": "application/json"}, method="POST")
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            status, body = response.status, response.read(200).decode("utf-8", "replace").strip()
+    except urllib.error.HTTPError as exc:  # Slack explains itself in the body, e.g. "channel_not_found"
+        raise SlackError(f"Slack answered {exc.code}: {exc.read(200).decode('utf-8', 'replace').strip()}") from None
+    if status != 200 or body != "ok":
+        raise SlackError(f"Slack answered {status}: {body}")
+
+
+def post_slack(cfg: Config, text: str) -> None:
+    """Post to the incoming webhook. The webhook URL is a secret and is never logged.
+
+    Slack-app webhooks always post to the channel chosen when the webhook was created and may refuse
+    a different one; legacy webhooks honour SLACK_CHANNEL. So if Slack complains about the channel,
+    post again without it, and say so.
+    """
+    payload = {"text": text}
+    if cfg.slack_channel:
+        payload["channel"] = cfg.slack_channel
+    try:
+        _slack_post(cfg.slack_webhook, payload)
+    except SlackError as exc:
+        if "channel" not in payload or "channel" not in str(exc).lower():
+            raise
+        log.warning("Slack did not accept the channel %s (%s); posting to the channel the webhook was "
+                    "created for instead", cfg.slack_channel, exc)
+        _slack_post(cfg.slack_webhook, {"text": text})
+
+
+def slack_text(cfg: Config, image: Optional[Path], score: float) -> str:
+    host = socket.gethostname()
+    text = f":rotating_light: *Motion detected* on `{host}` at {datetime.now():%Y-%m-%d %H:%M:%S} (score {score:.1f})"
+    if image is not None and cfg.web_port:
+        base = cfg.web_url or f"http://{host}.local:{cfg.web_port}"
+        text += f"\n<{base}/pictures/{image.name}|View picture>  ·  <{base}/|Open console>"
+    return text
+
+
+class SlackNotifier(_RetryWorker):
+    """Posts motion alerts to Slack."""
+
+    NAME = "slack"
+
+    def __init__(self, cfg: Config, sender: Callable = post_slack):
+        super().__init__(cfg, sender)
+
+    def _deliver_once(self, text: str) -> None:
+        self._send(self._cfg, text)
+        log.info("posted to Slack%s", f" ({self._cfg.slack_channel})" if self._cfg.slack_channel else "")
+
+    def _describe(self, text: str) -> str:
+        return "the Slack message"
 
 
 # --------------------------------------------------------------------------- cameras
+
+
+def describe_camera_error(exc: Exception, cfg: Config) -> str:
+    """Turn a low-level camera exception into advice the user can act on."""
+    if isinstance(exc, OSError) and exc.errno == errno.ENOMEM:
+        return (
+            f"the camera could not get enough contiguous memory (CMA) for {cfg.resolution[0]}x{cfg.resolution[1]} "
+            f"pictures with {cfg.buffer_count} buffers. Lower RESOLUTION (try 1280x720) or BUFFER_COUNT in "
+            "the settings file, or give the camera more CMA memory; see 'Out of camera memory' in the README."
+        )
+    return f"camera setup failed: {exc}"
 
 
 class PiCamera:
@@ -306,6 +451,8 @@ class PiCamera:
     Two streams: "main" (full size, saved as JPEG) and "lores" (small YUV420, used for detection;
     the first plane of YUV420 is the grey image, so no conversion is needed).
     """
+
+    NAME = "picamera2"
 
     def __init__(self, cfg: Config):
         try:
@@ -319,18 +466,39 @@ class PiCamera:
                 f"cannot open the camera: {exc}. Is it connected ('rpicam-hello --list-cameras'), "
                 "or already used by another program (sudo systemctl stop homesec)?"
             ) from None
+        self._cfg = cfg
         self._width, self._height = cfg.detect_size
-        config = self._cam.create_video_configuration(
-            main={"size": cfg.resolution, "format": "RGB888"},
-            lores={"size": cfg.detect_size, "format": "YUV420"},
-            controls={"FrameRate": cfg.fps},
-        )
-        self._cam.configure(config)
-        self._cam.options["quality"] = cfg.jpeg_quality
-        self._stride = self._cam.stream_configuration("lores")["stride"]
+        try:
+            model = str(self._cam.camera_properties.get("Model", "")).upper()  # e.g. IMX477
+        except Exception:  # not every camera reports a model
+            model = ""
+        self.label = f"{model} · picamera2" if model else self.NAME
+        try:
+            config = self._cam.create_video_configuration(
+                main={"size": cfg.resolution, "format": "RGB888"},
+                lores={"size": cfg.detect_size, "format": "YUV420"},
+                controls={"FrameRate": cfg.fps},
+                buffer_count=cfg.buffer_count,  # picamera2 default is 6; every buffer is a full picture in CMA memory
+            )
+            self._cam.configure(config)
+            self._cam.options["quality"] = cfg.jpeg_quality
+            self._stride = self._cam.stream_configuration("lores")["stride"]
+        except Exception as exc:
+            self._release()
+            raise CameraError(describe_camera_error(exc, cfg)) from None
+
+    def _release(self) -> None:
+        try:
+            self._cam.close()
+        except Exception as exc:  # already failing; do not hide the original error
+            log.debug("closing the camera failed: %s", exc)
 
     def start(self) -> None:
-        self._cam.start()
+        try:
+            self._cam.start()
+        except Exception as exc:
+            self._release()
+            raise CameraError(describe_camera_error(exc, self._cfg)) from None
 
     def read_gray(self) -> np.ndarray:
         buf = self._cam.capture_buffer("lores")
@@ -339,6 +507,12 @@ class PiCamera:
 
     def capture(self, path: Path) -> None:
         self._cam.capture_file(str(path))
+
+    def jpeg(self) -> bytes:
+        """The current picture as JPEG bytes, for the live view."""
+        buffer = io.BytesIO()
+        self._cam.capture_file(buffer, format="jpeg")
+        return buffer.getvalue()
 
     def close(self) -> None:
         try:
@@ -349,6 +523,9 @@ class PiCamera:
 
 class UsbCamera:
     """USB webcam via OpenCV (python3-opencv)."""
+
+    NAME = "opencv"
+    label = "USB camera · opencv"
 
     def __init__(self, cfg: Config):
         try:
@@ -383,6 +560,14 @@ class UsbCamera:
             self.read_gray()
         if not self._cv2.imwrite(str(path), self._last, [self._cv2.IMWRITE_JPEG_QUALITY, self._quality]):
             raise CameraError(f"could not write {path}")
+
+    def jpeg(self) -> bytes:
+        """A fresh picture as JPEG bytes, for the live view."""
+        self.read_gray()
+        ok, data = self._cv2.imencode(".jpg", self._last, [self._cv2.IMWRITE_JPEG_QUALITY, self._quality])
+        if not ok:
+            raise CameraError("could not encode the picture")
+        return data.tobytes()
 
     def close(self) -> None:
         self._cap.release()
@@ -452,19 +637,35 @@ class Watcher:
     """One detection step per camera frame; mails a picture on movement."""
 
     def __init__(self, cfg: Config, camera, mailer: Mailer,
-                 clock: Callable = time.monotonic, now: Callable = datetime.now):
+                 clock: Callable = time.monotonic, now: Callable = datetime.now,
+                 control: Optional["Control"] = None, slack: Optional["SlackNotifier"] = None):
         self.cfg = cfg
         self.camera = camera
         self.mailer = mailer
+        self.control = control
+        self.slack = slack
+        self.last_score = 0.0  # for the motion meter on the web page
         self.detector = MotionDetector(cfg.threshold, cfg.frames)
         self._clock = clock
         self._now = now
         self._started = clock()
         self._last_trigger: Optional[float] = None
+        self._was_paused = False
 
     def step(self) -> Optional[Path]:
+        if self.control is not None and self.control.paused:
+            if not self._was_paused:
+                log.info("detection paused")
+                self._was_paused = True
+            self.last_score = 0.0
+            return None  # frames are not even read
+        if self._was_paused:
+            log.info("detection resumed")
+            self._was_paused = False
+            self.detector = MotionDetector(self.cfg.threshold, self.cfg.frames)  # old frame is stale
         t = self._clock()
         moved, score = self.detector.update(self.camera.read_gray())
+        self.last_score = score
         if not moved:
             return None
         if t - self._started < self.cfg.warmup:
@@ -478,8 +679,313 @@ class Watcher:
         self._last_trigger = t
         log.info("motion (score %.1f), saved %s", score, path.name)
         self.mailer.submit(path)
+        if self.slack is not None:
+            self.slack.submit(slack_text(self.cfg, path, score))
         prune(self.cfg.image_dir, self.cfg.keep_days)
         return path
+
+
+# ------------------------------------------------------------------------ web console
+
+
+class Control:
+    """Pause switch shared by the web page and the detection loop. Kept in a file, so it survives restarts."""
+
+    def __init__(self, state_file: Path):
+        self._file = state_file
+        self.paused = state_file.exists()
+
+    def set_paused(self, paused: bool) -> None:
+        self.paused = paused
+        try:
+            if paused:
+                self._file.touch()
+            else:
+                self._file.unlink(missing_ok=True)
+        except OSError as exc:
+            log.warning("could not save the pause state: %s", exc)
+
+
+EVENT_NAME = re.compile(r"^\d{4}-\d{2}-\d{2}_\d{6}\.jpg$")
+EVENT_FORMAT = "%Y-%m-%d_%H%M%S"
+
+
+def _event_time(name: str) -> Optional[datetime]:
+    try:
+        return datetime.strptime(name[:-4], EVENT_FORMAT)
+    except ValueError:
+        return None
+
+
+def event_names(image_dir: Path) -> list:
+    """Names of the saved motion pictures (2026-11-01_044012.jpg), newest first."""
+    try:
+        names = [p.name for p in image_dir.iterdir() if EVENT_NAME.match(p.name)]
+    except OSError:
+        return []
+    return sorted((n for n in names if _event_time(n)), reverse=True)
+
+
+def describe_event(name: str) -> dict:
+    stamp = _event_time(name)
+    return {"name": name, "url": f"/pictures/{name}", "date": f"{stamp:%Y-%m-%d}",
+            "time": f"{stamp:%H:%M:%S}", "ts": int(stamp.timestamp())}
+
+
+class FrameHub:
+    """Latest camera picture for the live view: the detection loop publishes, stream handlers wait."""
+
+    def __init__(self):
+        self._cond = threading.Condition()
+        self._frame = b""
+        self._seq = 0
+        self._viewers = 0
+        self.closed = False
+
+    @property
+    def viewers(self) -> int:
+        return self._viewers
+
+    def add_viewer(self) -> int:
+        """Returns the current frame number, so a new viewer starts with a fresh picture."""
+        with self._cond:
+            self._viewers += 1
+            return self._seq
+
+    def remove_viewer(self) -> None:
+        with self._cond:
+            self._viewers = max(0, self._viewers - 1)
+
+    def publish(self, jpeg: bytes) -> None:
+        with self._cond:
+            self._frame = jpeg
+            self._seq += 1
+            self._cond.notify_all()
+
+    def close(self) -> None:
+        with self._cond:
+            self.closed = True
+            self._cond.notify_all()
+
+    def wait(self, last_seq: int, timeout: float) -> Optional[tuple]:
+        """Block until there is a frame newer than last_seq. Returns (seq, jpeg) or None on timeout/close."""
+        with self._cond:
+            self._cond.wait_for(lambda: self._seq != last_seq or self.closed, timeout)
+            if self.closed or self._seq == last_seq:
+                return None
+            return self._seq, self._frame
+
+
+class App:
+    """What the web console can see and change."""
+
+    def __init__(self, cfg: Config, control: Control, backend: str = "", names_ttl: float = 2.0):
+        self.cfg = cfg
+        self.control = control
+        self.backend = backend
+        self.hub = FrameHub()
+        self.started = time.time()
+        self.score = 0.0  # latest motion score, written by the detection loop
+        self._names: list = []
+        self._names_at = float("-inf")
+        self._names_ttl = names_ttl
+
+    def names(self) -> list:
+        """Picture names, cached briefly so several open pages do not rescan the folder all the time."""
+        now = time.monotonic()
+        if now - self._names_at >= self._names_ttl:
+            self._names, self._names_at = event_names(self.cfg.image_dir), now
+        return self._names
+
+    def status(self) -> dict:
+        cfg = self.cfg
+        names = self.names()
+        today = f"{datetime.now():%Y-%m-%d}"
+        return {
+            "detection": "paused" if self.control.paused else "on",
+            "score": round(self.score, 2),
+            "threshold": cfg.threshold,
+            "events_today": sum(n.startswith(today) for n in names),
+            "last_motion": describe_event(names[0]) if names else None,
+            "camera": self.backend,
+            "resolution": f"{cfg.resolution[0]}x{cfg.resolution[1]}",
+            "fps": cfg.fps,
+            "viewers": self.hub.viewers,
+            "uptime": int(time.time() - self.started),
+            "now": int(time.time()),
+            "host": socket.gethostname(),
+            "slack": {"enabled": bool(cfg.slack_webhook), "channel": cfg.slack_channel},
+        }
+
+    def events(self, limit: int = 30) -> list:
+        return [describe_event(n) for n in self.names()[:limit]]
+
+
+def host_allowed(host_header: str, extra: tuple = ()) -> bool:
+    """Accept IP addresses and local names only. A web page on another site that tricks the browser into
+    reaching this Pi under its own name (DNS rebinding) is refused, so it cannot read the camera."""
+    name = host_header.strip().lower()
+    if name.startswith("["):  # [::1]:8080
+        name = name[1:].split("]")[0]
+    elif name.count(":") == 1:  # name:8080
+        name = name.split(":")[0]
+    if not name:
+        return False
+    try:
+        ipaddress.ip_address(name)
+        return True
+    except ValueError:
+        pass
+    return name in ("localhost", socket.gethostname().lower()) or name.endswith(".local") \
+        or "." not in name or name in extra
+
+
+def make_handler(app: App):
+    cfg = app.cfg
+    security = {
+        "Content-Security-Policy": "default-src 'none'; img-src 'self' data:; style-src 'self'; script-src 'self'; "
+                                   "connect-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'",
+        "X-Content-Type-Options": "nosniff",
+        "X-Frame-Options": "DENY",
+        "Referrer-Policy": "no-referrer",
+    }
+
+    class Handler(BaseHTTPRequestHandler):
+        timeout = 30  # seconds: a stalled or half-open connection must not hold a thread for ever
+
+        def _send(self, code: int, body: bytes = b"", ctype: str = "text/plain; charset=utf-8",
+                  cache: str = "no-store") -> None:
+            self.send_response(code)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", cache)
+            for key, value in security.items():
+                self.send_header(key, value)
+            self.end_headers()
+            self.wfile.write(body)
+
+        def _json(self, data) -> None:
+            self._send(200, json.dumps(data).encode(), "application/json")
+
+        def _host_ok(self) -> bool:
+            if host_allowed(self.headers.get("Host", ""), cfg.web_allowed_hosts):
+                return True
+            self._send(403, b"host name not allowed; add it to WEB_ALLOWED_HOSTS in the settings file")
+            return False
+
+        def do_GET(self):
+            if not self._host_ok():
+                return
+            path = urlparse(self.path).path
+            if path == "/api/status":
+                return self._json(app.status())
+            if path == "/api/events":
+                return self._json({"events": app.events()})
+            if path == "/stream.mjpg":
+                return self._stream()
+            if path.startswith("/pictures/"):
+                return self._picture(path[len("/pictures/"):])
+            self._static("index.html" if path in ("/", "/index.html") else path.lstrip("/"))
+
+        def _static(self, name: str) -> None:
+            if not STATIC_NAME.match(name):
+                return self._send(404, b"not found")
+            try:
+                data = (cfg.static_dir / name).read_bytes()
+            except OSError:
+                if name == "index.html":
+                    return self._send(500, f"web console files not found in {cfg.static_dir}".encode())
+                return self._send(404, b"not found")
+            ctype = mimetypes.guess_type(name)[0] or "application/octet-stream"
+            if ctype.startswith("text/") or ctype.endswith("javascript"):
+                ctype += "; charset=utf-8"
+            self._send(200, data, ctype, "no-cache")
+
+        def _picture(self, name: str) -> None:
+            if not EVENT_NAME.match(name):  # no slashes or dots: nothing outside the picture folder
+                return self._send(404, b"not found")
+            try:
+                data = (cfg.image_dir / name).read_bytes()
+            except OSError:
+                return self._send(404, b"not found")
+            self._send(200, data, "image/jpeg", "private, max-age=3600")
+
+        def _client_gone(self) -> bool:
+            """True when the viewer closed the connection. Needed because with no new pictures there is
+            nothing to write, and only a failing write would show it."""
+            try:
+                readable, _, _ = select.select([self.connection], [], [], 0)
+                return bool(readable) and self.connection.recv(1, socket.MSG_PEEK) == b""
+            except OSError:
+                return True
+
+        def _stream(self) -> None:
+            hub = app.hub
+            if hub.viewers >= MAX_VIEWERS:
+                return self._send(503, b"too many viewers")
+            self.send_response(200)
+            self.send_header("Content-Type", "multipart/x-mixed-replace; boundary=frame")
+            self.send_header("Cache-Control", "no-store")
+            for key, value in security.items():
+                self.send_header(key, value)
+            self.end_headers()
+            seq = hub.add_viewer()
+            try:
+                while not hub.closed:
+                    item = hub.wait(seq, timeout=5)
+                    if item is None:
+                        if self._client_gone():
+                            break
+                        continue
+                    seq, frame = item
+                    self.wfile.write(b"--frame\r\nContent-Type: image/jpeg\r\nContent-Length: %d\r\n\r\n" % len(frame))
+                    self.wfile.write(frame)
+                    self.wfile.write(b"\r\n")
+            except OSError:  # the viewer closed the page
+                pass
+            finally:
+                hub.remove_viewer()
+
+        def do_POST(self):
+            if not self._host_ok():
+                return
+            origin = self.headers.get("Origin")  # a page on another site must not flip the switch
+            if origin and urlparse(origin).netloc != self.headers.get("Host"):
+                return self._send(403, b"forbidden")
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+            except ValueError:
+                length = -1
+            if urlparse(self.path).path != "/api/detection":
+                return self._send(404, b"not found")
+            if not 0 <= length <= 100:
+                return self._send(400, b"bad request")
+            state = parse_qs(self.rfile.read(length).decode("ascii", "replace")).get("state", [""])[0]
+            if state not in ("on", "off"):
+                return self._send(400, b"bad request")
+            app.control.set_paused(state == "off")
+            log.info("detection switched %s from the web page (%s)", state, self.client_address[0])
+            self._json(app.status())
+
+        def log_message(self, fmt, *args):
+            log.debug("web: " + fmt, *args)
+
+    return Handler
+
+
+def start_web(app: App):
+    cfg = app.cfg
+    if cfg.web_port == 0:
+        return None
+    try:
+        server = ThreadingHTTPServer((cfg.web_host, cfg.web_port), make_handler(app))
+    except OSError as exc:  # detection must keep working without the page
+        log.error("web page not started on %s:%d: %s", cfg.web_host, cfg.web_port, exc)
+        return None
+    threading.Thread(target=server.serve_forever, name="web", daemon=True).start()
+    shown = f"{socket.gethostname()}.local" if cfg.web_host in ("", "0.0.0.0") else cfg.web_host
+    log.info("web console on http://%s:%d/ (no login: keep it on a trusted network)", shown, cfg.web_port)
+    return server
 
 
 # --------------------------------------------------------------------------- commands
@@ -494,21 +1000,58 @@ def cmd_run(cfg: Config) -> int:
     prune(cfg.image_dir, cfg.keep_days)
     mailer = Mailer(cfg)
     mailer.start()
+    slack = SlackNotifier(cfg) if cfg.slack_webhook else None
+    if slack:
+        slack.start()
+    control = Control(cfg.image_dir / ".paused")
+    if control.paused:
+        log.info("starting with detection paused (use the web page to resume)")
     camera = open_camera(cfg)
+    app = App(cfg, control, getattr(camera, "label", getattr(camera, "NAME", "")))
+    server = None
     try:
         camera.start()
-        watcher = Watcher(cfg, camera, mailer)
-        log.info("watching for movement (%.1f fps, threshold %.1f, cooldown %ds), mailing to %s",
-                 cfg.fps, cfg.threshold, cfg.cooldown, ", ".join(cfg.mail_to))
+        server = start_web(app)
+        watcher = Watcher(cfg, camera, mailer, control=control, slack=slack)
+        log.info("watching for movement (%.1f fps, threshold %.1f, cooldown %ds), mailing to %s%s",
+                 cfg.fps, cfg.threshold, cfg.cooldown, ", ".join(cfg.mail_to), " and posting to Slack" if slack else "")
         interval = 1.0 / cfg.fps
+        view_failed = False
         while not stop.is_set():
             began = time.monotonic()
             watcher.step()
+            app.score = watcher.last_score
+            if app.hub.viewers:  # pictures for the live view are only made while someone is watching
+                try:
+                    app.hub.publish(camera.jpeg())
+                    view_failed = False
+                except Exception as exc:  # the live view must never stop the alarm
+                    if not view_failed:
+                        log.warning("live view picture failed: %s", exc)
+                        view_failed = True
             stop.wait(max(0.0, interval - (time.monotonic() - began)))
         log.info("stopping")
     finally:
+        app.hub.close()
+        if server is not None:
+            server.shutdown()
+            server.server_close()
         camera.close()
         mailer.close()
+        if slack:
+            slack.close()
+    return 0
+
+
+def cmd_slacktest(cfg: Config) -> int:
+    if not cfg.slack_webhook:
+        raise ConfigError("SLACK_WEBHOOK_URL is not set")
+    try:
+        post_slack(cfg, f":white_check_mark: homeSec test message from `{socket.gethostname()}`")
+    except OSError as exc:
+        log.error("posting to Slack failed: %s", exc)
+        return 1
+    log.info("test message posted to Slack%s", f" ({cfg.slack_channel})" if cfg.slack_channel else "")
     return 0
 
 
@@ -548,9 +1091,9 @@ def cmd_mailtest(cfg: Config) -> int:
 
 def main(argv: Optional[list] = None) -> int:
     parser = argparse.ArgumentParser(prog="homesec", description="Mail a picture when the camera sees movement.")
-    parser.add_argument("command", nargs="?", default="run", choices=("run", "snapshot", "mailtest"),
-                        help="run (default): watch and mail; snapshot: mail one picture now; "
-                             "mailtest: send a test mail")
+    parser.add_argument("command", nargs="?", default="run", choices=("run", "snapshot", "mailtest", "slacktest"),
+                        help="run (default): watch, mail and post to Slack; snapshot: mail one picture now; "
+                             "mailtest / slacktest: send a test mail / Slack message")
     parser.add_argument("--env", metavar="FILE", help=f"settings file (default: first of $HOMESEC_ENV, ./.env, {DEFAULT_ENV_FILE})")
     parser.add_argument("-v", "--verbose", action="store_true", help="show debug messages")
     args = parser.parse_args(argv)
@@ -562,7 +1105,8 @@ def main(argv: Optional[list] = None) -> int:
         cfg = Config.load(args.env)
         if not args.verbose:
             logging.getLogger().setLevel(cfg.log_level.upper())
-        return {"run": cmd_run, "snapshot": cmd_snapshot, "mailtest": cmd_mailtest}[args.command](cfg)
+        return {"run": cmd_run, "snapshot": cmd_snapshot, "mailtest": cmd_mailtest,
+                "slacktest": cmd_slacktest}[args.command](cfg)
     except ConfigError as exc:
         log.error("settings: %s", exc)
         return EX_CONFIG
