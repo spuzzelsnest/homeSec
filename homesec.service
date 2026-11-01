@@ -1,5 +1,5 @@
 [Unit]
-Description=homeSec - Survailance motiong detectio
+Description=homeSec - mail a picture when the camera sees movement
 Documentation=https://github.com/spuzzelsnest/homeSec
 After=network-online.target
 Wants=network-online.target
@@ -8,18 +8,24 @@ Wants=network-online.target
 Type=simple
 User=homesec
 Group=homesec
+# The camera devices belong to the "video" group.
 SupplementaryGroups=video
+# Read by systemd as root, so the file can stay private (root:homesec 0640).
 EnvironmentFile=/etc/homesec/homesec.env
 Environment=HOME=/var/lib/homesec
 ExecStart=/usr/local/bin/homesec run
 
+# /var/lib/homesec (IMAGE_DIR) is created and owned by the homesec user.
+# If you change IMAGE_DIR, add its path to ReadWritePaths=.
 StateDirectory=homesec
 StateDirectoryMode=0750
 
+# Keep running if the mail server or camera hiccups; but not when the settings are wrong (exit 78).
 Restart=always
 RestartSec=10
 RestartPreventExitStatus=78
 
+# Hardening. The camera needs /dev, so PrivateDevices is deliberately not set.
 NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=yes

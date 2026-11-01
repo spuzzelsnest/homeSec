@@ -1,6 +1,5 @@
 .gitignore
 
-#Directories
-motion/*
-sendFiles/
 
+#Directories
+tests/

@@ -59,6 +59,10 @@ fi
 
 echo "== Installing homeSec =="
 sudo install -m 0755 "$SCRIPT_DIR/homesec.py" /usr/local/bin/homesec
+sudo rm -rf /usr/local/share/homesec/static
+sudo install -d -m 0755 /usr/local/share/homesec
+sudo cp -r "$SCRIPT_DIR/static" /usr/local/share/homesec/static
+sudo chmod -R u=rwX,go=rX /usr/local/share/homesec
 sudo install -d -m 0750 -o "$service_user" -g "$service_user" "$image_dir"
 sudo chown -R "$service_user:$service_user" "$image_dir"   # older versions used the motion user
 
@@ -87,7 +91,8 @@ Done. The service is enabled but NOT started yet. Next steps (see README.md):
   1. sudoedit $env_file            # MAIL_TO and the SMTP_* mail settings
   2. sudo -u $service_user homesec mailtest     # does a test mail arrive?
   3. sudo -u $service_user homesec snapshot     # does a picture from the camera arrive?
-  4. sudo systemctl start homesec               # and: journalctl -u homesec -f
+  4. sudo -u $service_user homesec slacktest    # optional: Slack set up?
+  5. sudo systemctl start homesec               # and: journalctl -u homesec -f
 
 Software from older versions is no longer needed. If nothing else on this Pi uses it, remove it:
   sudo apt purge motion fswebcam mutt msmtp-mta inotify-tools && sudo apt autoremove
