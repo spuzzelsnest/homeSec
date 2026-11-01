@@ -1,0 +1,96 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>homeSec Console</title>
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/style.css">
+  <script src="/app.js" defer></script>
+</head>
+<body>
+  <header class="bar">
+    <div class="brand">
+      <svg class="logo" viewBox="0 0 32 32" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <rect x="2.5" y="8" width="18" height="16" rx="3.5"/>
+        <circle cx="11.5" cy="16" r="4.2"/>
+        <circle cx="11.5" cy="16" r="1.3" fill="currentColor" stroke="none"/>
+        <path d="M20.5 14.2 29 10v12l-8.5-4.2z"/>
+      </svg>
+      <div>
+        <h1>homeSec Console</h1>
+        <p id="subtitle" class="muted">Connecting…</p>
+      </div>
+    </div>
+    <div class="actions">
+      <button id="detection" class="pill" type="button" data-state="unknown" aria-pressed="false">
+        <span class="dot" aria-hidden="true"></span><span id="detection-label">Detection</span>
+      </button>
+      <span id="live" class="pill" data-state="connecting" role="status">
+        <span class="dot" aria-hidden="true"></span><span id="live-label">Connecting</span>
+      </span>
+    </div>
+  </header>
+
+  <main class="layout">
+    <section class="panel viewer" aria-label="Live camera view">
+      <div id="stage" class="stage">
+        <img id="stream" alt="Live view of the camera">
+        <div id="overlay" class="overlay" hidden>
+          <p id="overlay-text">Waiting for the camera…</p>
+        </div>
+        <span id="stamp" class="stamp" aria-hidden="true"></span>
+        <span id="motion-badge" class="motion-badge" hidden>Motion</span>
+        <button id="fullscreen" class="icon-btn" type="button" aria-label="Full screen" title="Full screen">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5"/></svg>
+        </button>
+      </div>
+      <footer class="panel-foot">
+        <span id="stream-info">—</span>
+        <span id="viewers"></span>
+      </footer>
+    </section>
+
+    <aside class="side">
+      <section class="panel">
+        <h2>Motion level</h2>
+        <div id="meter" class="meter" role="meter" aria-label="Motion score" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
+          <div id="meter-fill" class="meter-fill"></div>
+          <div class="meter-mark" title="Alert threshold"></div>
+        </div>
+        <p class="readout"><b id="score">0.00</b> <span class="muted">/ alert at <span id="threshold">–</span></span></p>
+        <canvas id="spark" class="spark" width="320" height="64" aria-hidden="true"></canvas>
+      </section>
+
+      <section class="panel">
+        <h2>Activity</h2>
+        <dl class="facts">
+          <div><dt>Events today</dt><dd id="events-today">0</dd></div>
+          <div><dt>Last motion</dt><dd id="last-motion">—</dd></div>
+          <div><dt>Camera up</dt><dd id="uptime">—</dd></div>
+        </dl>
+      </section>
+
+      <section class="panel log">
+        <h2>Event log</h2>
+        <ol id="events" class="events" aria-live="polite">
+          <li class="empty">Waiting for events…</li>
+        </ol>
+      </section>
+
+      <p id="alerts" class="alerts muted"></p>
+    </aside>
+  </main>
+
+  <dialog id="lightbox" aria-label="Captured picture">
+    <form method="dialog">
+      <img id="lightbox-img" alt="Captured picture">
+      <p id="lightbox-caption" class="muted"></p>
+      <button class="icon-btn close" aria-label="Close">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M6 6l12 12M18 6 6 18"/></svg>
+      </button>
+    </form>
+  </dialog>
+</body>
+</html>
