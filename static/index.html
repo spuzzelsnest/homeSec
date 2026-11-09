@@ -79,6 +79,13 @@
         </ol>
       </section>
 
+      <section id="visits-panel" class="panel log" hidden>
+        <h2>Visits <span id="visits-what" class="muted"></span> <span id="visit-rec" class="rec" hidden>● recording</span></h2>
+        <ol id="visits" class="events" aria-live="polite">
+          <li class="empty">No visits yet…</li>
+        </ol>
+      </section>
+
       <p id="alerts" class="alerts muted"></p>
     </aside>
   </main>
@@ -86,6 +93,7 @@
   <dialog id="lightbox" aria-label="Captured picture">
     <form method="dialog">
       <img id="lightbox-img" alt="Captured picture">
+      <video id="lightbox-video" controls playsinline muted loop hidden></video>
       <div class="viewer-bar">
         <p id="lightbox-caption" class="muted"></p>
         <div class="viewer-actions">

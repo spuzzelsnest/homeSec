@@ -17,6 +17,8 @@ How detection works, in two steps:
 
 Each alert mail has the full-size picture and a short animated GIF: about 3 seconds before to 2 seconds after the alert, with the time on every frame and a red border from the moment of the alert (`CLIP_*` settings). The web console shows the clip when you open an event. After an alert, nothing is sent for `COOLDOWN` seconds (5 minutes by default).
 
+**Visits.** Some visitors are welcome: when the check sees a **bird** (`RECORD_OBJECTS`), homeSec records a video instead of alerting, from 3 seconds *before* it was seen (the camera keeps the last seconds of video in memory, encoded in hardware) until 7 seconds after it was last seen, at most a minute. No mail, no Slack. The videos are in the web console under **Visits** (play, download, delete) and in `/var/lib/homesec/visits`, and are kept for 30 days (`VISIT_KEEP_DAYS`). Birds are small and fast, so for them the check zooms in tightly on the movement and accepts a lower confidence (`VISIT_CONFIDENCE`, 30%), but only where the movement is; now and then a leaf may still be taken for a bird, which only costs a short video. To also keep the cat: `RECORD_OBJECTS="bird,cat"`. Visits need `python3-av`, which `deploy.sh` installs.
+
 ## Install
 
 ```

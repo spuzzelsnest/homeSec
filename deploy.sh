@@ -40,7 +40,7 @@ if [[ $EUID -eq 0 ]]; then
 fi
 
 echo "== Installing packages =="
-packages=(python3-picamera2 python3-numpy python3-pil curl)
+packages=(python3-picamera2 python3-numpy python3-pil python3-av curl)
 (( use_check )) && packages+=(python3-opencv)
 missing=()
 for pkg in "${packages[@]}"; do

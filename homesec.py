@@ -13,7 +13,7 @@ Settings are read from the first of these files that exists:
 Environment variables override the file. See homesec.env.example.
 
 Needs only Raspberry Pi OS packages: python3-picamera2, python3-numpy and python3-pil (the alert
-clip), plus python3-opencv for the person check (and for a USB webcam). No pip. The person check also needs a model file, which
+clip), plus python3-opencv for the person check (and for a USB webcam), python3-av for the visit videos. No pip. The person check also needs a model file, which
 deploy.sh downloads (YOLOX-tiny, Apache-2.0 licence).
 """
 from __future__ import annotations
@@ -242,6 +242,15 @@ class Config:
     clip_after: float
     clip_fps: float
     clip_width: int
+    record_objects: tuple
+    visit_confidence: float
+    record_min_area: float
+    video_before: float
+    video_after: float
+    video_max: float
+    video_fps: float
+    video_kbps: int
+    visit_keep_days: int
     warmup: float
     cooldown: float
     keep_days: int
@@ -306,6 +315,14 @@ class Config:
             raise ConfigError(f"OBJECTS: unknown name(s) {', '.join(unknown) or '(empty)'}; use names like "
                               "person, cat, dog, car (the COCO object names)")
         object_model = Path(r.text("OBJECT_MODEL")) if r.text("OBJECT_MODEL") else default_model_file()
+        record_objects = tuple(o.strip().lower() for o in r.text("RECORD_OBJECTS", "bird").split(",")
+                               if o.strip() and o.strip().lower() != "none")
+        unknown = [o for o in record_objects if o not in COCO_NAMES]
+        if unknown:
+            raise ConfigError(f"RECORD_OBJECTS: unknown name(s) {', '.join(unknown)}; use names like bird, cat, dog")
+        both = [o for o in record_objects if o in objects]
+        if both:
+            raise ConfigError(f"{', '.join(both)} is in both OBJECTS (alert) and RECORD_OBJECTS (record); choose one")
 
         return cls(
             mail_to=recipients,
@@ -338,6 +355,15 @@ class Config:
             clip_after=r.number("CLIP_AFTER", 2.0, float, 0, 10),
             clip_fps=r.number("CLIP_FPS", 2.0, float, 0.5, 10),
             clip_width=r.number("CLIP_WIDTH", 640, int, 0, 1920),  # 0 = no clip
+            record_objects=record_objects,
+            visit_confidence=r.number("VISIT_CONFIDENCE", 0.3, float, 0.05, 0.99),
+            record_min_area=r.number("RECORD_MIN_AREA", 0.3, float, 0.1, 100),
+            video_before=r.number("VIDEO_BEFORE", 3.0, float, 0, 10),
+            video_after=r.number("VIDEO_AFTER", 7.0, float, 1, 120),
+            video_max=r.number("VIDEO_MAX", 60.0, float, 5, 600),
+            video_fps=r.number("VIDEO_FPS", 15.0, float, 1, 30),
+            video_kbps=r.number("VIDEO_KBPS", 4000, int, 500, 25000),
+            visit_keep_days=r.number("VISIT_KEEP_DAYS", 30, int, 1, 3650),
             warmup=r.number("WARMUP", 5.0, float, 0, 600),
             cooldown=r.number("COOLDOWN", 300.0, float, 1, 86400),
             keep_days=r.number("KEEP_DAYS", 7, int, 1, 3650),
@@ -620,6 +646,63 @@ def shrink_rgb(bgr: np.ndarray, width: int) -> np.ndarray:
     return np.ascontiguousarray(bgr[::step, ::step, 2::-1])
 
 
+class VideoBuffer:
+    """The last few seconds of video, encoded in hardware (H.264) and kept in memory, so a recording
+    can start before the moment something was seen. open() writes them, and what follows, to an MP4
+    until close(). Needs picamera2's CircularOutput2 and PyavOutput (python3-av).
+
+    The buffer delays the output by `before` seconds, so a recording closed at time T ends at
+    T - before: callers close `before` seconds after the last moment they want in the video.
+    """
+
+    def __init__(self, cam, before: float, kbps: int, fps: float):
+        from picamera2.encoders import H264Encoder
+        from picamera2.outputs import CircularOutput2, PyavOutput
+        import av  # noqa: F401  (python3-av; PyavOutput imports it only when used)
+
+        self._cam = cam
+        self._pyav = PyavOutput
+        self._circular = CircularOutput2(buffer_duration_ms=int(before * 1000))
+        # a keyframe every second: a recording can only start at a keyframe
+        self._encoder = H264Encoder(bitrate=kbps * 1000, iperiod=max(1, round(fps)), repeat=True)
+        self._current: Optional[tuple] = None
+
+    def start(self) -> None:
+        self._cam.start_encoder(self._encoder, self._circular, name="main")
+
+    @property
+    def recording(self) -> bool:
+        return self._current is not None
+
+    def open(self, path: Path) -> None:
+        part = path.with_name(path.name + ".part")  # renamed when complete, so the web page never shows half
+        try:  # faststart: the index at the front, so a browser can play while it downloads
+            output = self._pyav(str(part), format="mp4", options={"movflags": "+faststart"})
+            self._circular.open_output(output)
+        except Exception as exc:
+            log.debug("mp4 with faststart failed (%s), trying without", exc)
+            output = self._pyav(str(part), format="mp4")
+            self._circular.open_output(output)
+        output.error_callback = lambda exc: log.error("writing %s failed: %s", path.name, exc)
+        self._current = (part, path)
+
+    def close(self) -> Optional[Path]:
+        if self._current is None:
+            return None
+        part, path = self._current
+        self._current = None
+        self._circular.close_output()
+        if part.is_file() and part.stat().st_size > 0:
+            part.replace(path)
+            return path
+        part.unlink(missing_ok=True)
+        return None
+
+    def stop(self) -> None:
+        self.close()
+        self._cam.stop_encoder(self._encoder)
+
+
 class PiCamera:
     """Raspberry Pi camera (ribbon cable, and USB cameras libcamera supports) via picamera2.
 
@@ -645,6 +728,8 @@ class PiCamera:
         self._width, self._height = cfg.detect_size
         self.color_width = 0  # when set, read_gray also keeps a small colour copy in .color
         self.color: Optional[np.ndarray] = None
+        self.video: Optional[VideoBuffer] = None
+        video = bool(cfg.record_objects) and cfg.object_check != "off"
         try:
             model = str(self._cam.camera_properties.get("Model", "")).upper()  # e.g. IMX477
         except Exception:  # not every camera reports a model
@@ -654,8 +739,13 @@ class PiCamera:
             config = self._cam.create_video_configuration(
                 main={"size": cfg.resolution, "format": "RGB888"},
                 lores={"size": cfg.detect_size, "format": "YUV420"},
-                controls={"FrameRate": cfg.fps},
-                buffer_count=cfg.buffer_count,  # picamera2 default is 6; every buffer is a full picture in CMA memory
+                # With visit videos the camera runs at up to VIDEO_FPS, but may slow down to FPS in the
+                # dark (longer exposure); detection still looks at FPS frames per second.
+                controls=({"FrameDurationLimits": (int(1e6 / max(cfg.video_fps, cfg.fps)), int(1e6 / cfg.fps))}
+                          if video else {"FrameRate": cfg.fps}),
+                # picamera2 default is 6; every buffer is a full picture in CMA memory. The video encoder
+                # holds one more.
+                buffer_count=cfg.buffer_count + (1 if video else 0),
             )
             self._cam.configure(config)
             self._cam.options["quality"] = cfg.jpeg_quality
@@ -663,6 +753,11 @@ class PiCamera:
         except Exception as exc:
             self._release()
             raise CameraError(describe_camera_error(exc, cfg)) from None
+        if video:
+            try:
+                self.video = VideoBuffer(self._cam, cfg.video_before, cfg.video_kbps, cfg.video_fps)
+            except ImportError as exc:
+                log.warning("no visit videos: %s (sudo apt install python3-av, or run ./deploy.sh)", exc)
 
     def _release(self) -> None:
         try:
@@ -671,6 +766,12 @@ class PiCamera:
             log.debug("closing the camera failed: %s", exc)
 
     def start(self) -> None:
+        if self.video is not None:
+            try:
+                self.video.start()
+            except Exception as exc:  # the alarm matters more than the videos
+                log.warning("no visit videos: the video encoder did not start (%s)", exc)
+                self.video = None
         try:
             self._cam.start()
         except Exception as exc:
@@ -699,6 +800,11 @@ class PiCamera:
 
     def close(self) -> None:
         try:
+            if self.video is not None:
+                try:
+                    self.video.stop()
+                except Exception as exc:
+                    log.warning("stopping the video encoder failed: %s", exc)
             self._cam.stop()
         finally:
             self._cam.close()
@@ -948,13 +1054,17 @@ class Found:
 class ObjectCheck:
     """Looks for a person (or other OBJECTS) in a picture with the YOLOX-tiny model via OpenCV.
 
-    Run only when the motion detector reports movement, on the full picture and, when the movement
-    is small, once more on a crop around it (far-away people are small).
+    Run only when the motion detector reports movement: on the full picture and, when the movement
+    is small, once more on a crop around it (far-away people are small). Optionally it also looks for
+    `extra` objects (RECORD_OBJECTS, e.g. birds) that are recorded instead of alerted. Those are small
+    and fast, so they get a tight square zoom on the movement and their own, lower confidence.
+    The alert objects always win: a person next to a bird is an alert.
     """
 
     SIZE = 416  # model input, pixels
 
-    def __init__(self, model: Path, objects: tuple = ("person",), confidence: float = 0.5):
+    def __init__(self, model: Path, objects: tuple = ("person",), confidence: float = 0.5,
+                 extra: tuple = (), extra_confidence: float = 0.25):
         try:
             import cv2
         except ImportError as exc:
@@ -968,7 +1078,8 @@ class ObjectCheck:
             raise ConfigError(f"cannot load the model {model}: {exc}") from None
         self.objects = tuple(objects)
         self.confidence = confidence
-        self._ids = np.array([COCO_NAMES.index(o) for o in objects])
+        self.extra = tuple(extra)
+        self.extra_confidence = extra_confidence
         grids, strides = [], []
         for stride in (8, 16, 32):
             n = self.SIZE // stride
@@ -978,45 +1089,82 @@ class ObjectCheck:
         self._grid = np.concatenate(grids).astype(np.float32)
         self._stride = np.concatenate(strides).astype(np.float32)
 
-    def _detect(self, image: np.ndarray) -> Optional[Found]:
-        """Best match in a BGR picture, or None."""
+    def _run(self, image: np.ndarray) -> tuple:
+        """The model's raw answer for a BGR picture, plus what is needed to map boxes back."""
         cv2, size = self._cv2, self.SIZE
         h, w = image.shape[:2]
         scale = min(size / h, size / w)
         canvas = np.full((size, size, 3), 114, np.uint8)
         canvas[: int(h * scale), : int(w * scale)] = cv2.resize(image, (int(w * scale), int(h * scale)))
         self._net.setInput(cv2.dnn.blobFromImage(canvas))
-        out = self._net.forward()[0]  # rows: cx, cy, w, h, objectness, 80 class scores
-        scores = out[:, 4:5] * out[:, 5:][:, self._ids]
+        return self._net.forward()[0], scale, w, h  # rows: cx, cy, w, h, objectness, 80 class scores
+
+    def _best(self, run: tuple, names: tuple, confidence: float) -> Optional[Found]:
+        out, scale, w, h = run
+        if not names:
+            return None
+        ids = np.array([COCO_NAMES.index(n) for n in names])
+        scores = out[:, 4:5] * out[:, 5:][:, ids]
         row, col = np.unravel_index(int(np.argmax(scores)), scores.shape)
         best = float(scores[row, col])
-        if best < self.confidence:
+        if best < confidence:
             return None
         cx, cy = (out[row, :2] + self._grid[row]) * self._stride[row]
         bw, bh = np.exp(out[row, 2:4]) * self._stride[row]
         box = ((cx - bw / 2) / scale / w, (cy - bh / 2) / scale / h, (cx + bw / 2) / scale / w, (cy + bh / 2) / scale / h)
-        return Found(self.objects[col], best, tuple(float(min(1.0, max(0.0, v))) for v in box))
+        return Found(names[col], best, tuple(float(min(1.0, max(0.0, v))) for v in box))
 
-    def find(self, image: np.ndarray, near: Optional[tuple] = None) -> Optional[Found]:
-        found = self._detect(image)
-        if found is not None or near is None:
-            return found
-        x0, y0, x1, y1 = near
-        if x1 - x0 > 0.5 and y1 - y0 > 0.5:
-            return None  # large movement: the full picture was enough
+    def _detect(self, image: np.ndarray) -> Optional[Found]:
+        """Best alert object in a BGR picture, or None."""
+        return self._best(self._run(image), self.objects, self.confidence)
+
+    @staticmethod
+    def _crop(image: np.ndarray, near: tuple, factor: float, minimum: float, square: bool) -> tuple:
+        """A crop around `near` (fractions), `factor` times its size, at least `minimum` of the picture."""
         h, w = image.shape[:2]
-        side = max(x1 - x0, y1 - y0) * 2.5  # some room around the movement, at least a third of the picture
-        half_w, half_h = max(side, 1 / 3) * w / 2, max(side, 1 / 3) * h / 2
+        x0, y0, x1, y1 = near
         cx, cy = (x0 + x1) / 2 * w, (y0 + y1) / 2 * h
+        if square:  # in pixels: small things are compared at their real shape
+            side = max(max((x1 - x0) * w, (y1 - y0) * h) * factor, minimum * min(w, h))
+            half_w = half_h = side / 2
+        else:
+            side = max(max(x1 - x0, y1 - y0) * factor, minimum)
+            half_w, half_h = side * w / 2, side * h / 2
         left, top = int(max(0, cx - half_w)), int(max(0, cy - half_h))
         right, bottom = int(min(w, cx + half_w)), int(min(h, cy + half_h))
-        found = self._detect(image[top:bottom, left:right])
+        return image[top:bottom, left:right], (left, top, right, bottom)
+
+    @staticmethod
+    def _uncrop(found: Optional[Found], frame: tuple, w: int, h: int) -> Optional[Found]:
         if found is None:
             return None
+        left, top, right, bottom = frame
         bx0, by0, bx1, by1 = found.box
         cw, ch = right - left, bottom - top
         box = ((left + bx0 * cw) / w, (top + by0 * ch) / h, (left + bx1 * cw) / w, (top + by1 * ch) / h)
         return Found(found.label, found.confidence, box)
+
+    def find(self, image: np.ndarray, near: Optional[tuple] = None) -> Optional[Found]:
+        h, w = image.shape[:2]
+        full = self._run(image)
+        found = self._best(full, self.objects, self.confidence)
+        if found is not None:
+            return found
+        small = near is not None and not (near[2] - near[0] > 0.5 and near[3] - near[1] > 0.5)
+        if small:  # some room around the movement, at least a third of the picture
+            crop, frame = self._crop(image, near, 2.5, 1 / 3, square=False)
+            found = self._uncrop(self._best(self._run(crop), self.objects, self.confidence), frame, w, h)
+            if found is not None:
+                return found
+        if not self.extra:
+            return None
+        found = self._best(full, self.extra, self.extra_confidence)
+        if found is None and small:  # tight zoom: a bird is a few dozen pixels in the full picture
+            crop, frame = self._crop(image, near, 2.0, 0.12, square=True)
+            found = self._uncrop(self._best(self._run(crop), self.extra, self.extra_confidence), frame, w, h)
+        if found is not None and near is not None and not overlaps(found.box, near):
+            return None  # the model is less sure of these: it must be where the movement is
+        return found
 
     def find_in_file(self, path: Path, near: Optional[tuple] = None) -> Optional[Found]:
         image = self._cv2.imread(str(path))
@@ -1025,20 +1173,46 @@ class ObjectCheck:
         return self.find(image, near)
 
 
+def overlaps(box: tuple, near: tuple, margin: float = 0.5) -> bool:
+    """Whether box touches `near` grown by `margin` of its size on every side (all fractions)."""
+    x0, y0, x1, y1 = near
+    gx, gy = (x1 - x0) * margin + 0.01, (y1 - y0) * margin + 0.01
+    return box[0] <= x1 + gx and box[2] >= x0 - gx and box[1] <= y1 + gy and box[3] >= y0 - gy
+
+
 def open_object_check(cfg: Config) -> Optional[ObjectCheck]:
     """The object check, or None when it is off. With OBJECT_CHECK=auto a missing OpenCV or model
     only gives a warning: then every movement is alerted, as before."""
     if cfg.object_check == "off":
         return None
     try:
-        check = ObjectCheck(cfg.object_model, cfg.objects, cfg.object_confidence)
+        check = ObjectCheck(cfg.object_model, cfg.objects, cfg.object_confidence,
+                            cfg.record_objects, cfg.visit_confidence)
     except ConfigError as exc:
         if cfg.object_check == "on":
             raise
         log.warning("object check not available (%s); alerting on every movement", exc)
         return None
-    log.info("object check on: alerting only for %s (model %s)", ", ".join(cfg.objects), cfg.object_model.name)
+    log.info("object check on: alerting only for %s%s (model %s)", ", ".join(cfg.objects),
+             f", recording visits of {', '.join(cfg.record_objects)}" if cfg.record_objects else "",
+             cfg.object_model.name)
     return check
+
+
+def prune_visits(visit_dir: Path, keep_days: int) -> int:
+    """Delete visit videos (and their picture and notes) older than keep_days, and stale half files."""
+    now = time.time()
+    removed = 0
+    for path in [*visit_dir.glob("*.mp4"), *visit_dir.glob("*.jpg"), *visit_dir.glob("*.json"),
+                 *visit_dir.glob("*.part")]:
+        try:
+            age = now - path.stat().st_mtime
+            if age > keep_days * 86400 or (path.suffix == ".part" and age > 3600):
+                path.unlink()
+                removed += 1
+        except OSError as exc:
+            log.warning("could not remove %s: %s", path, exc)
+    return removed
 
 
 def prune(image_dir: Path, keep_days: int) -> int:
@@ -1096,6 +1270,17 @@ class ClipRecorder:
             clip[2](tuple(clip[1]))
 
 
+@dataclass
+class Visit:
+    """A visit being recorded."""
+
+    base: Path          # visits/2026-11-10_073012 (.mp4, .jpg, .json)
+    label: str
+    confidence: float
+    start: float        # clock times
+    until: float
+
+
 class Watcher:
     """One detection step per camera frame; alerts with a picture when something moves."""
 
@@ -1110,7 +1295,12 @@ class Watcher:
         self.slack = slack
         self.check = check
         self.last_score = 0.0  # moving part of the picture in percent, for the meter on the web page
-        self.detector = MotionDetector(cfg.min_area, cfg.max_area, cfg.frames, cfg.mask)
+        self.video = getattr(camera, "video", None)  # VideoBuffer, or None: no visit videos
+        self.visits = self.video is not None and check is not None and bool(cfg.record_objects)
+        self.visit: Optional[Visit] = None
+        # birds are small: with visits on, smaller movements are looked at too (the check decides)
+        min_area = min(cfg.min_area, cfg.record_min_area) if self.visits else cfg.min_area
+        self.detector = MotionDetector(min_area, cfg.max_area, cfg.frames, cfg.mask)
         self.recorder = ClipRecorder(cfg.clip_before, cfg.clip_after, cfg.clip_fps) if cfg.clip_width else None
         self._clock = clock
         self._now = now
@@ -1132,6 +1322,8 @@ class Watcher:
             self._was_paused = False
             self.detector.reset()  # the background is stale
         t = self._clock()
+        if self.visit is not None and t >= self.visit.until + self.cfg.video_before:
+            self._end_visit(t)
         grab = self.recorder is not None and self.recorder.due(t)
         if grab:
             self.camera.color_width = self.cfg.clip_width
@@ -1152,7 +1344,8 @@ class Watcher:
         if t - self._started < self.cfg.warmup:
             log.debug("movement (%.1f%%) ignored during warm-up", result.area)
             return None
-        if self._last_trigger is not None and t - self._last_trigger < self.cfg.cooldown:
+        cooldown = self._last_trigger is not None and t - self._last_trigger < self.cfg.cooldown
+        if cooldown and not self.visits:
             log.debug("movement (%.1f%%) ignored, cooldown active", result.area)
             return None
         if self.check is not None and self._last_check is not None and t - self._last_check < self.cfg.recheck:
@@ -1168,11 +1361,21 @@ class Watcher:
             except Exception as exc:  # a failing check must not silence the alarm
                 log.error("object check failed (%s); alerting anyway", exc)
             else:
+                if found is not None and found.label in self.cfg.record_objects:
+                    self._seen_visitor(t, path, found)
+                    return None
                 if found is None:
-                    log.info("movement over %.1f%% of the picture, but no %s seen: no alert",
-                             result.area, " or ".join(self.check.objects))
+                    if result.area >= self.cfg.min_area:  # smaller ones are only looked at for visitors
+                        log.info("movement over %.1f%% of the picture, but no %s seen: no alert",
+                                 result.area, " or ".join(self.check.objects))
+                    else:
+                        log.debug("small movement (%.1f%%), nothing recognised", result.area)
                     self._reject(path)
                     return None
+        if cooldown:  # a person again, within the cooldown: no new alert
+            log.debug("%s seen again (%.1f%%), cooldown active", found.label if found else "movement", result.area)
+            path.unlink(missing_ok=True)
+            return None
         event = Event(path, result.area, found.label if found else "", found.confidence if found else 0.0, stamp)
         self._last_trigger = t
         log.info("%s (%s), saved %s", event.headline().lower(), event.details(), path.name)
@@ -1187,9 +1390,53 @@ class Watcher:
         return path
 
     def flush(self) -> None:
-        """Send alerts whose clip is still being recorded now (pause, shutdown)."""
+        """Send alerts whose clip is still being recorded now and end a visit video (pause, shutdown)."""
         if self.recorder is not None:
             self.recorder.flush()
+        if self.visit is not None:
+            self._end_visit(self._clock())
+
+    # ---- visits (RECORD_OBJECTS): a video, no alert
+    def _seen_visitor(self, t: float, path: Path, found: Found) -> None:
+        cfg = self.cfg
+        if self.visit is not None:  # still there: keep recording, up to VIDEO_MAX
+            self.visit.until = min(self.visit.start + cfg.video_max, t + cfg.video_after)
+            self.visit.confidence = max(self.visit.confidence, found.confidence)
+            path.unlink(missing_ok=True)
+            return
+        visit_dir = cfg.image_dir / "visits"
+        base = visit_dir / path.stem
+        try:
+            visit_dir.mkdir(exist_ok=True)
+            self.video.open(base.with_suffix(".mp4"))
+            path.replace(base.with_suffix(".jpg"))  # the moment it was recognised, as a thumbnail
+        except Exception as exc:
+            log.error("could not start the visit video: %s", exc)
+            path.unlink(missing_ok=True)
+            return
+        self.visit = Visit(base, found.label, found.confidence, t, t + cfg.video_after)
+        log.info("%s visiting (%.0f%% sure): recording %s.mp4", found.label, found.confidence * 100, base.name)
+        prune_visits(visit_dir, cfg.visit_keep_days)
+
+    def _end_visit(self, t: float) -> None:
+        visit, self.visit = self.visit, None
+        try:
+            video = self.video.close()
+        except Exception as exc:
+            log.error("could not finish the visit video %s.mp4: %s", visit.base.name, exc)
+            return
+        seconds = round(min(t, visit.until + self.cfg.video_before) - visit.start + self.cfg.video_before)
+        if video is None:
+            log.warning("the visit video %s.mp4 came out empty", visit.base.name)
+            visit.base.with_suffix(".jpg").unlink(missing_ok=True)
+            return
+        try:
+            visit.base.with_suffix(".json").write_text(json.dumps(
+                {"label": visit.label, "confidence": round(visit.confidence, 2), "seconds": seconds}))
+        except OSError as exc:
+            log.warning("could not save the notes for %s: %s", video.name, exc)
+        log.info("%s visit saved: %s (about %d s, %.1f MB)", visit.label, video.name, seconds,
+                 video.stat().st_size / 1e6)
 
     def _reject(self, path: Path) -> None:
         """Keep the picture of a rejected movement in rejected/ (KEEP_REJECTED=yes), else delete it."""
@@ -1227,6 +1474,8 @@ class Control:
 
 EVENT_NAME = re.compile(r"^\d{4}-\d{2}-\d{2}_\d{6}\.jpg$")
 MEDIA_NAME = re.compile(r"^\d{4}-\d{2}-\d{2}_\d{6}\.(jpg|gif)$")
+VISIT_NAME = re.compile(r"^\d{4}-\d{2}-\d{2}_\d{6}\.mp4$")
+VISIT_MEDIA = re.compile(r"^\d{4}-\d{2}-\d{2}_\d{6}\.(mp4|jpg)$")
 EVENT_FORMAT = "%Y-%m-%d_%H%M%S"
 
 
@@ -1305,6 +1554,8 @@ class App:
         self.control = control
         self.backend = backend
         self.objects = objects  # what the object check looks for; empty when it is off
+        self.record: tuple = ()  # what is recorded as a visit; empty when visits are off
+        self.visiting = ""       # label of the visit being recorded right now
         self.hub = FrameHub()
         self.started = time.time()
         self.score = 0.0  # latest motion score, written by the detection loop
@@ -1328,6 +1579,8 @@ class App:
             "score": round(self.score, 2),
             "threshold": cfg.min_area,
             "check": {"enabled": bool(self.objects), "objects": list(self.objects)},
+            "visits": {"enabled": bool(self.record), "objects": list(self.record), "recording": self.visiting,
+                       "today": self._visits_today(), "last": self._last_visit()},
             "events_today": sum(n.startswith(today) for n in names),
             "last_motion": describe_event(names[0]) if names else None,
             "camera": self.backend,
@@ -1340,6 +1593,48 @@ class App:
             "slack": {"enabled": bool(cfg.slack_webhook), "channel": cfg.slack_channel},
         }
 
+    @property
+    def visit_dir(self) -> Path:
+        return self.cfg.image_dir / "visits"
+
+    def visits(self, limit: int = 60) -> list:
+        try:
+            names = sorted((p.name for p in self.visit_dir.iterdir() if VISIT_NAME.match(p.name)), reverse=True)
+        except OSError:
+            return []
+        visits = []
+        for name in names[:limit]:
+            stamp = _event_time(name)
+            if stamp is None:
+                continue
+            stem = name[:-4]
+            visit = {"name": name, "url": f"/videos/{name}", "date": f"{stamp:%Y-%m-%d}",
+                     "time": f"{stamp:%H:%M:%S}", "ts": int(stamp.timestamp()), "label": "", "seconds": None}
+            if (self.visit_dir / f"{stem}.jpg").is_file():
+                visit["thumb"] = f"/videos/{stem}.jpg"
+            try:
+                notes = json.loads((self.visit_dir / f"{stem}.json").read_text())
+                visit["label"], visit["seconds"] = str(notes.get("label", "")), notes.get("seconds")
+            except (OSError, ValueError):
+                pass
+            try:
+                visit["mb"] = round((self.visit_dir / name).stat().st_size / 1e6, 1)
+            except OSError:
+                continue
+            visits.append(visit)
+        return visits
+
+    def delete_visit(self, name: str) -> bool:
+        if not VISIT_NAME.match(name):
+            return False
+        path = self.visit_dir / name
+        if not path.is_file():
+            return False
+        path.unlink()
+        for suffix in (".jpg", ".json"):
+            path.with_suffix(suffix).unlink(missing_ok=True)
+        return True
+
     def delete_event(self, name: str) -> bool:
         """Delete a saved picture and its clip. False when there is no such picture."""
         if not EVENT_NAME.match(name):
@@ -1351,6 +1646,25 @@ class App:
         path.with_suffix(".gif").unlink(missing_ok=True)
         self._names_at = float("-inf")  # rescan the folder on the next request
         return True
+
+    def _visit_names(self) -> list:
+        now = time.monotonic()
+        if now - getattr(self, "_visit_names_at", float("-inf")) >= self._names_ttl:
+            try:
+                self._visit_name_cache = sorted((p.name for p in self.visit_dir.iterdir() if VISIT_NAME.match(p.name)),
+                                                reverse=True)
+            except OSError:
+                self._visit_name_cache = []
+            self._visit_names_at = now
+        return self._visit_name_cache
+
+    def _visits_today(self) -> int:
+        today = f"{datetime.now():%Y-%m-%d}"
+        return sum(n.startswith(today) for n in self._visit_names())
+
+    def _last_visit(self) -> str:
+        names = self._visit_names()
+        return names[0] if names else ""
 
     def events(self, limit: int = 30) -> list:
         events = []
@@ -1385,7 +1699,8 @@ def host_allowed(host_header: str, extra: tuple = ()) -> bool:
 def make_handler(app: App):
     cfg = app.cfg
     security = {
-        "Content-Security-Policy": "default-src 'none'; img-src 'self' data:; style-src 'self'; script-src 'self'; "
+        "Content-Security-Policy": "default-src 'none'; img-src 'self' data:; media-src 'self'; style-src 'self'; "
+                                   "script-src 'self'; "
                                    "connect-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'",
         "X-Content-Type-Options": "nosniff",
         "X-Frame-Options": "DENY",
@@ -1428,6 +1743,10 @@ def make_handler(app: App):
                 return self._json({"events": app.events()})
             if path == "/stream.mjpg":
                 return self._stream()
+            if path == "/api/visits":
+                return self._json({"visits": app.visits()})
+            if path.startswith("/videos/"):
+                return self._video(path[len("/videos/"):], "download" in parse_qs(url.query))
             if path.startswith("/pictures/"):
                 return self._picture(path[len("/pictures/"):], "download" in parse_qs(url.query))
             self._static("index.html" if path in ("/", "/index.html") else path.lstrip("/"))
@@ -1456,6 +1775,52 @@ def make_handler(app: App):
             ctype = "image/gif" if name.endswith(".gif") else "image/jpeg"
             extra = {"Content-Disposition": f'attachment; filename="homesec_{name}"'} if download else None
             self._send(200, data, ctype, "private, max-age=3600", extra)
+
+        def _video(self, name: str, download: bool) -> None:
+            """Visit videos and their pictures. Supports byte ranges: browsers (Safari above all) need
+            them to play and seek in a video."""
+            if not VISIT_MEDIA.match(name):
+                return self._send(404, b"not found")
+            path = app.visit_dir / name
+            try:
+                size = path.stat().st_size
+                handle = path.open("rb")
+            except OSError:
+                return self._send(404, b"not found")
+            with handle:
+                start, end = 0, size - 1
+                ranged = re.match(r"^bytes=(\d*)-(\d*)$", self.headers.get("Range", "").strip())
+                if ranged and (ranged.group(1) or ranged.group(2)):
+                    if ranged.group(1):
+                        start = int(ranged.group(1))
+                        end = min(int(ranged.group(2)), size - 1) if ranged.group(2) else size - 1
+                    else:  # the last N bytes
+                        start = max(0, size - int(ranged.group(2)))
+                    if start > end or start >= size:
+                        return self._send(416, b"range not satisfiable", extra={"Content-Range": f"bytes */{size}"})
+                self.send_response(206 if ranged and (ranged.group(1) or ranged.group(2)) else 200)
+                self.send_header("Content-Type", "video/mp4" if name.endswith(".mp4") else "image/jpeg")
+                self.send_header("Content-Length", str(end - start + 1))
+                self.send_header("Accept-Ranges", "bytes")
+                if ranged and (ranged.group(1) or ranged.group(2)):
+                    self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
+                if download:
+                    self.send_header("Content-Disposition", f'attachment; filename="homesec_visit_{name}"')
+                self.send_header("Cache-Control", "private, max-age=3600")
+                for key, value in security.items():
+                    self.send_header(key, value)
+                self.end_headers()
+                handle.seek(start)
+                left = end - start + 1
+                try:
+                    while left > 0:
+                        chunk = handle.read(min(65536, left))
+                        if not chunk:
+                            break
+                        self.wfile.write(chunk)
+                        left -= len(chunk)
+                except OSError:  # the viewer stopped watching
+                    pass
 
         def _client_gone(self) -> bool:
             """True when the viewer closed the connection. Needed because with no new pictures there is
@@ -1504,11 +1869,24 @@ def make_handler(app: App):
             except ValueError:
                 length = -1
             path = urlparse(self.path).path
-            if path not in ("/api/detection", "/api/events/delete"):
+            if path not in ("/api/detection", "/api/events/delete", "/api/visits/delete"):
                 return self._send(404, b"not found")
             if not 0 <= length <= 100:
                 return self._send(400, b"bad request")
             form = parse_qs(self.rfile.read(length).decode("ascii", "replace"))
+            if path == "/api/visits/delete":
+                name = form.get("name", [""])[0]
+                if not VISIT_NAME.match(name):
+                    return self._send(400, b"bad request")
+                try:
+                    if not app.delete_visit(name):
+                        return self._send(404, b"not found")
+                except OSError as exc:
+                    log.error("could not delete %s: %s", name, exc)
+                    return self._send(500, b"could not delete the video")
+                app._visit_names_at = float("-inf")
+                log.info("visit video %s deleted from the web page (%s)", name, self.client_address[0])
+                return self._json({"deleted": name, "visits": app.visits()})
             if path == "/api/events/delete":
                 name = form.get("name", [""])[0]
                 if not EVENT_NAME.match(name):
@@ -1577,6 +1955,10 @@ def cmd_run(cfg: Config) -> int:
         camera.start()
         server = start_web(app)
         watcher = Watcher(cfg, camera, mailer, control=control, slack=slack, check=check)
+        if watcher.visits:
+            app.record = cfg.record_objects
+            log.info("recording visits of %s (%.0f s before to %.0f s after, %.0f fps)", ", ".join(cfg.record_objects),
+                     cfg.video_before, cfg.video_after, cfg.video_fps)
         log.info("watching for movement (%.1f fps, min. area %.1f%%, cooldown %ds), mailing to %s%s",
                  cfg.fps, cfg.min_area, cfg.cooldown, ", ".join(cfg.mail_to), " and posting to Slack" if slack else "")
         interval = 1.0 / cfg.fps
@@ -1585,6 +1967,7 @@ def cmd_run(cfg: Config) -> int:
             began = time.monotonic()
             watcher.step()
             app.score = watcher.last_score
+            app.visiting = watcher.visit.label if watcher.visit else ""
             if app.hub.viewers:  # pictures for the live view are only made while someone is watching
                 try:
                     app.hub.publish(camera.jpeg())

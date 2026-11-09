@@ -9,7 +9,7 @@
     'overlay-text', 'stamp', 'motion-badge', 'fullscreen', 'stream-info', 'viewers', 'meter',
     'meter-fill', 'score', 'threshold', 'spark', 'events-today', 'last-motion', 'uptime', 'events',
     'alerts', 'lightbox', 'lightbox-img', 'lightbox-caption', 'lightbox-download', 'lightbox-clip',
-    'lightbox-delete',
+    'lightbox-delete', 'lightbox-video', 'visits-panel', 'visits', 'visits-what', 'visit-rec',
   ].map((id) => [camel(id), document.getElementById(id)]));
 
   const POLL_MS = 600;       // status refresh while the page is visible
@@ -223,23 +223,143 @@
     renderEvents(response.ok ? (await response.json()).events : (await getJSON('/api/events')).events);
   }
 
-  const disarmViewer = armable(el.lightboxDelete, 'Delete? Click again', () => deleteEvent(viewing));
+  const disarmViewer = armable(el.lightboxDelete, 'Delete? Click again',
+    () => (viewing && viewing.kind === 'visit' ? deleteVisit(viewing) : deleteEvent(viewing)));
+
+  function showMedia(video) {
+    el.lightboxImg.hidden = video;
+    el.lightboxVideo.hidden = !video;
+  }
 
   function openPicture(event) {
-    viewing = event;
+    viewing = { ...event, kind: 'event' };
+    showMedia(false);
     el.lightboxImg.src = event.clip || event.url;  // the clip (seconds before and after) when there is one
     el.lightboxCaption.textContent = `${event.date}  ${event.time}${event.clip ? '  · clip' : ''}`;
+    el.lightboxDownload.textContent = 'Picture';
     el.lightboxDownload.href = download(event.url);
     el.lightboxClip.hidden = !event.clip;
     if (event.clip) el.lightboxClip.href = download(event.clip);
     disarmViewer();
     el.lightbox.showModal();
   }
+
+  function openVisit(visit) {
+    viewing = { ...visit, kind: 'visit' };
+    showMedia(true);
+    el.lightboxVideo.src = visit.url;
+    if (visit.thumb) el.lightboxVideo.poster = visit.thumb;
+    el.lightboxCaption.textContent = `${visit.date}  ${visit.time}  · ${visitText(visit)}`;
+    el.lightboxDownload.textContent = 'Video';
+    el.lightboxDownload.href = download(visit.url);
+    el.lightboxClip.hidden = true;
+    disarmViewer();
+    el.lightbox.showModal();
+    el.lightboxVideo.play().catch(() => { /* the person can press play */ });
+  }
+
   el.lightbox.addEventListener('click', (e) => { if (e.target === el.lightbox) el.lightbox.close(); });
   el.lightbox.addEventListener('close', () => {
     el.lightboxImg.removeAttribute('src');
+    el.lightboxVideo.pause();
+    el.lightboxVideo.removeAttribute('src');
+    el.lightboxVideo.removeAttribute('poster');
+    el.lightboxVideo.load();
     viewing = null;
   });
+
+  // ---------- visits (videos of RECORD_OBJECTS, e.g. birds)
+  let visitsKey = null;
+  const visitText = (v) => [v.label, v.seconds ? `${v.seconds} s` : '', v.mb != null ? `${v.mb} MB` : '']
+    .filter(Boolean).join(' · ');
+
+  async function deleteVisit(visit) {
+    const response = await fetch('/api/visits/delete', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: `name=${encodeURIComponent(visit.name)}`,
+    });
+    if (!response.ok && response.status !== 404) throw new Error(String(response.status));
+    if (viewing && viewing.name === visit.name) el.lightbox.close();
+    visitsKey = null;
+    renderVisits(response.ok ? (await response.json()).visits : (await getJSON('/api/visits')).visits);
+  }
+
+  function renderVisits(visits) {
+    el.visits.replaceChildren();
+    if (!visits.length) {
+      const li = document.createElement('li');
+      li.className = 'empty';
+      li.textContent = 'No visits yet…';
+      el.visits.append(li);
+      return;
+    }
+    const today = dateText(serverNow());
+    for (const visit of visits) {
+      const li = document.createElement('li');
+      li.className = 'event-row';
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.className = 'event';
+      button.setAttribute('aria-label', `Play the visit from ${visit.date} ${visit.time}`);
+      const thumb = document.createElement('div');
+      thumb.className = 'thumb play';
+      if (visit.thumb) {
+        const img = document.createElement('img');
+        img.src = visit.thumb;
+        img.alt = '';
+        img.loading = 'lazy';
+        thumb.append(img);
+      }
+      const text = document.createElement('div');
+      const time = document.createElement('b');
+      time.textContent = visit.time;
+      const day = document.createElement('span');
+      day.textContent = `${visit.date === today ? 'Today' : visit.date} · ${visitText(visit)}`;
+      text.append(time, day);
+      button.append(thumb, text);
+      button.addEventListener('click', () => openVisit(visit));
+      const box = document.createElement('div');
+      box.className = 'event-actions';
+      const get = document.createElement('a');
+      get.className = 'icon-btn small';
+      get.href = download(visit.url);
+      get.setAttribute('download', '');
+      get.title = 'Download the video';
+      get.setAttribute('aria-label', `Download the video from ${visit.date} ${visit.time}`);
+      get.innerHTML = ICONS.download;
+      const del = document.createElement('button');
+      del.type = 'button';
+      del.className = 'icon-btn small danger';
+      del.title = 'Delete (click twice)';
+      del.setAttribute('aria-label', `Delete the video from ${visit.date} ${visit.time}`);
+      del.innerHTML = ICONS.trash;
+      armable(del, 'Delete?', () => deleteVisit(visit));
+      box.append(get, del);
+      li.append(button, box);
+      el.visits.append(li);
+    }
+  }
+
+  async function loadVisits() {
+    try {
+      renderVisits((await getJSON('/api/visits')).visits);
+    } catch (err) {
+      visitsKey = null;
+    }
+  }
+
+  function updateVisits(v) {
+    el.visitsPanel.hidden = !v || (!v.enabled && !v.last);
+    if (el.visitsPanel.hidden) return;
+    el.visitsWhat.textContent = v.objects.length ? `· ${v.objects.join(', ')}` : '';
+    el.visitRec.hidden = !v.recording;
+    const key = `${v.today}|${v.last}|${v.recording}`;
+    if (key !== visitsKey) {
+      visitsKey = key;
+      loadVisits();
+    }
+  }
 
   function eventActions(event) {
     const box = document.createElement('div');
@@ -347,6 +467,8 @@
     targets.push('Mail');
     const only = s.check && s.check.enabled ? ` · only for ${s.check.objects.join(', ')}` : '';
     el.alerts.textContent = `Alerts → ${targets.join(' · ')}${only}`;
+
+    updateVisits(s.visits);
 
     const key = `${s.events_today}|${s.last_motion ? s.last_motion.name : ''}`;
     if (key !== eventsKey) {
