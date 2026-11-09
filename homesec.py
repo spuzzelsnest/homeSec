@@ -132,6 +132,11 @@ def read_settings(env_file: Optional[str], environ: Mapping[str, str]) -> dict:
             if env_file:
                 raise ConfigError(f"settings file {candidate} not found") from None
         except PermissionError:
+            if candidate == ".env" and not env_file:
+                # The optional ./.env in a folder the service user may not enter (your home folder):
+                # skip it and use the real settings file.
+                log.debug("cannot look for ./.env here (no permission), skipping it")
+                continue
             raise ConfigError(
                 f"no permission to read {candidate} (run as the service user: sudo -u homesec homesec ...)"
             ) from None
