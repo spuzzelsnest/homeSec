@@ -92,7 +92,9 @@ sudo install -d -m 0750 -o "$service_user" -g "$service_user" "$image_dir"
 sudo chown -R "$service_user:$service_user" "$image_dir"   # older versions used the motion user
 
 sudo install -d -m 0750 -o root -g "$service_user" /etc/homesec
-if [[ -e $env_file ]]; then
+# Checked with sudo: /etc/homesec is not readable for your normal user (it holds the mail password),
+# so a plain [[ -e ]] would always say "missing" and the example would overwrite your settings.
+if sudo test -e "$env_file"; then
     echo "$env_file already exists, leaving the settings alone."
     sudo chgrp "$service_user" "$env_file"
     sudo chmod 0640 "$env_file"
@@ -102,7 +104,7 @@ if [[ -e $env_file ]]; then
     fi
 else
     sudo install -m 0640 -o root -g "$service_user" "$SCRIPT_DIR/homesec.env.example" "$env_file"
-    echo "Created $env_file"
+    echo "Created $env_file: fill in your mail settings once (sudoedit $env_file); later runs keep them."
 fi
 
 echo "== Installing service =="
