@@ -22,12 +22,12 @@ Each alert mail has the full-size picture and a short animated GIF: about 3 seco
 ```
 git clone https://github.com/spuzzelsnest/homeSec.git
 cd homeSec
-./preps.sh            # --no-check: without the person check
+./deploy.sh            # --no-check: without the person check
 ```
 
-`preps.sh` installs `python3-picamera2`, `python3-numpy`, `python3-pil` and `python3-opencv` with apt, downloads the person-check model (about 20 MB, checksum verified) to `/usr/local/share/homesec/models`, creates a `homesec` service user (member of `video`), installs the program as `/usr/local/bin/homesec`, creates `/etc/homesec/homesec.env` and installs and enables `homesec.service`. Run it again after updating the repo; your settings are left alone.
+`deploy.sh` installs `python3-picamera2`, `python3-numpy`, `python3-pil` and `python3-opencv` with apt, downloads the person-check model (about 20 MB, checksum verified) to `/usr/local/share/homesec/models`, creates a `homesec` service user (member of `video`), installs the program as `/usr/local/bin/homesec`, creates `/etc/homesec/homesec.env` and installs and enables `homesec.service`. Run it again after updating the repo; your settings are left alone.
 
-At the end `preps.sh` tests everything itself and starts the service: it takes a camera picture and mails it, runs the person check on it, posts a Slack test message (if set up), restarts `homesec` and prints a short result table plus the last log lines. That is one test mail per run. On the first run it offers to open the settings file, because the mail settings must be filled in once. `./preps.sh --no-test` skips the tests and does not start the service. The steps below are the same tests by hand, for troubleshooting. If `motion` is installed it is disabled, because it would keep the camera busy.
+At the end `deploy.sh` tests everything itself and starts the service: it takes a camera picture and mails it, runs the person check on it, posts a Slack test message (if set up), restarts `homesec` and prints a short result table plus the last log lines. That is one test mail per run. On the first run it offers to open the settings file, because the mail settings must be filled in once. `./deploy.sh --no-test` skips the tests and does not start the service. The steps below are the same tests by hand, for troubleshooting. If `motion` is installed it is disabled, because it would keep the camera busy.
 
 ## Settings
 
@@ -67,7 +67,7 @@ Set `SLACK_WEBHOOK_URL` (an [incoming webhook](https://api.slack.com/messaging/w
 
 ## Web console
 
-While the service runs, open `http://<name-or-ip-of-the-Pi>:8080/` (for example `http://pycam.local:8080/`). It has the live camera view (MJPEG, up to 4 viewers), a motion meter with graph, today's activity, the event log with pictures, and one button that pauses or resumes detection. While paused the camera is not watched and no alerts are sent. The choice survives a restart. The files are in `static/` (`index.html`, `style.css`, `app.js`); `preps.sh` copies them to `/usr/local/share/homesec/static`.
+While the service runs, open `http://<name-or-ip-of-the-Pi>:8080/` (for example `http://pycam.local:8080/`). It has the live camera view (MJPEG, up to 4 viewers), a motion meter with graph, today's activity, the event log with pictures, and one button that pauses or resumes detection. While paused the camera is not watched and no alerts are sent. The choice survives a restart. The files are in `static/` (`index.html`, `style.css`, `app.js`); `deploy.sh` copies them to `/usr/local/share/homesec/static`.
 
 Watching the live view makes detection slower while a page is open, more so at a high `RESOLUTION`; `1280x720` and `FPS=10` is a good choice.
 
@@ -86,11 +86,11 @@ Every alert says what triggered it, for example `Person detected (person 87% sur
 
 ## USB webcam
 
-Run `./preps.sh` (it installs `python3-opencv`) and set `CAMERA="opencv"`, optionally `VIDEO_DEVICE="/dev/video0"`, in the settings file. With `CAMERA="auto"` a USB webcam is used when no Pi camera is found. The Pi camera path is the one developed for this project; the USB path is basic.
+Run `./deploy.sh` (it installs `python3-opencv`) and set `CAMERA="opencv"`, optionally `VIDEO_DEVICE="/dev/video0"`, in the settings file. With `CAMERA="auto"` a USB webcam is used when no Pi camera is found. The Pi camera path is the one developed for this project; the USB path is basic.
 
 ## Updating from the older version (motion + fswebcam + msmtp)
 
-Run `./preps.sh`. It stops the old service, disables `motion`, gives the service user ownership of `/var/lib/homesec` and keeps your `/etc/homesec/homesec.env`. That file needs the new mail settings (`SMTP_HOST`, `SMTP_USER`, `SMTP_PASSWORD`; `EMAIL` still works as `MAIL_TO`). Afterwards you can remove the old software, the installer prints the commands.
+Run `./deploy.sh`. It stops the old service, disables `motion`, gives the service user ownership of `/var/lib/homesec` and keeps your `/etc/homesec/homesec.env`. That file needs the new mail settings (`SMTP_HOST`, `SMTP_USER`, `SMTP_PASSWORD`; `EMAIL` still works as `MAIL_TO`). Afterwards you can remove the old software, the installer prints the commands.
 
 ## Troubleshooting
 

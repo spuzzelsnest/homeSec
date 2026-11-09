@@ -14,7 +14,7 @@ Environment variables override the file. See homesec.env.example.
 
 Needs only Raspberry Pi OS packages: python3-picamera2, python3-numpy and python3-pil (the alert
 clip), plus python3-opencv for the person check (and for a USB webcam). No pip. The person check also needs a model file, which
-preps.sh downloads (YOLOX-tiny, Apache-2.0 licence).
+deploy.sh downloads (YOLOX-tiny, Apache-2.0 licence).
 """
 from __future__ import annotations
 
@@ -73,13 +73,13 @@ COCO_NAMES = (
 
 
 def default_static_dir() -> Path:
-    """The web console files: the "static" folder next to this file, or where preps.sh installs them."""
+    """The web console files: the "static" folder next to this file, or where deploy.sh installs them."""
     here = Path(__file__).resolve().parent / "static"
     return here if here.is_dir() else Path("/usr/local/share/homesec/static")
 
 
 def default_model_file() -> Path:
-    """The person-check model: in "models" next to this file, or where preps.sh installs it."""
+    """The person-check model: in "models" next to this file, or where deploy.sh installs it."""
     here = Path(__file__).resolve().parent / "models" / MODEL_NAME
     return here if here.is_file() else Path("/usr/local/share/homesec/models") / MODEL_NAME
 
@@ -955,7 +955,7 @@ class ObjectCheck:
         except ImportError as exc:
             raise ConfigError(f"the object check needs OpenCV ({exc}); run: sudo apt install python3-opencv") from None
         if not model.is_file():
-            raise ConfigError(f"model file {model} not found; run ./preps.sh again, which downloads it")
+            raise ConfigError(f"model file {model} not found; run ./deploy.sh again, which downloads it")
         self._cv2 = cv2
         try:
             self._net = cv2.dnn.readNetFromONNX(str(model))

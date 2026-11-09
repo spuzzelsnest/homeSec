@@ -3,7 +3,7 @@
 # Install homeSec on Raspberry Pi OS (Debian). Run as your normal user; sudo is asked for.
 # Safe to run again: it installs the latest program and service file, and keeps your settings.
 #
-# Usage: ./preps.sh [--no-check] [--no-test]
+# Usage: ./deploy.sh [--no-check] [--no-test]
 #   --no-check   skip the person check: no OpenCV, no model download (every movement is alerted)
 #   --no-test    do not test and start the service at the end
 #   --usb        accepted for older instructions; OpenCV (needed for a USB webcam) is installed anyway
@@ -150,7 +150,7 @@ if placeholders || ! sudo grep -qE '^SMTP_HOST=.+' "$env_file"; then
         fi
     fi
     if placeholders || ! sudo grep -qE '^SMTP_HOST=.+' "$env_file"; then
-        echo "Still not filled in. Edit it (sudoedit $env_file) and run ./preps.sh again."
+        echo "Still not filled in. Edit it (sudoedit $env_file) and run ./deploy.sh again."
         old_software_note
         exit 1
     fi
@@ -224,7 +224,7 @@ echo "Last log lines:"
 sudo journalctl -u homesec.service -n 6 --no-pager -o cat | sed 's/^/  /'
 echo
 if (( failed )); then
-    echo "Something failed (see above). Fix it and run ./preps.sh again."
+    echo "Something failed (see above). Fix it and run ./deploy.sh again."
 else
     echo "All good. Watch it live with: journalctl -u homesec -f   (web console: http://$(hostname).local:8080/)"
 fi
