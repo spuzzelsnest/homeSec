@@ -121,12 +121,20 @@ sudo systemctl daemon-reload
 sudo systemctl enable homesec.service
 
 old_software_note() {
-    cat <<EOF
-
-Software from older versions is no longer needed. If nothing else on this Pi uses it, remove it:
-  sudo apt purge motion fswebcam mutt msmtp-mta inotify-tools && sudo apt autoremove
-  sudo rm -f /etc/msmtprc /etc/msmtp-password    # old mail settings, may contain your password
-EOF
+    # Only when something from the old version (motion + fswebcam + mutt/msmtp) is still on this Pi.
+    local old=() files=() pkg f
+    for pkg in motion fswebcam mutt msmtp msmtp-mta inotify-tools; do
+        dpkg-query -W -f='${Status}' "$pkg" 2>/dev/null | grep -q 'install ok installed' && old+=("$pkg")
+    done
+    for f in /etc/msmtprc /etc/msmtp-password; do
+        sudo test -e "$f" && files+=("$f")
+    done
+    (( ${#old[@]} + ${#files[@]} )) || return 0
+    echo
+    echo "Left over from the old version, no longer needed. If nothing else on this Pi uses it, remove it:"
+    (( ${#old[@]} )) && echo "  sudo apt purge ${old[*]} && sudo apt autoremove"
+    (( ${#files[@]} )) && echo "  sudo rm -f ${files[*]}    # old mail settings, may contain your password"
+    return 0
 }
 
 if (( ! use_test )); then
