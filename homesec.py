@@ -2,17 +2,19 @@
 """homeSec - mail a picture when the camera sees movement.
 
 Commands:
-  homesec run        watch the camera and mail a picture on movement (the service)
-  homesec snapshot   take one picture now and mail it (stop the service first)
-  homesec mailtest   send a test mail without using the camera
-  homesec slacktest  post a test message to Slack
+  homesec run          watch the camera and mail a picture on movement (the service)
+  homesec snapshot     take one picture now and mail it (stop the service first)
+  homesec mailtest     send a test mail without using the camera
+  homesec slacktest    post a test message to Slack
+  homesec check IMAGE  run the person check on a picture and show what it finds
 
 Settings are read from the first of these files that exists:
   --env FILE, $HOMESEC_ENV, ./.env, /etc/homesec/homesec.env
 Environment variables override the file. See homesec.env.example.
 
-Needs only the Raspberry Pi OS packages python3-picamera2 and python3-numpy
-(python3-opencv as well for a USB webcam). No pip, no other software.
+Needs only Raspberry Pi OS packages: python3-picamera2, python3-numpy and python3-pil (the alert
+clip), plus python3-opencv for the person check (and for a USB webcam). No pip. The person check also needs a model file, which
+preps.sh downloads (YOLOX-tiny, Apache-2.0 licence).
 """
 from __future__ import annotations
 
@@ -36,8 +38,9 @@ import threading
 import time
 import urllib.error
 import urllib.request
-from dataclasses import dataclass, field
-from datetime import datetime
+from collections import deque
+from dataclasses import dataclass, field, replace
+from datetime import datetime, timedelta
 from email.message import EmailMessage
 from email.utils import formatdate, make_msgid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -53,12 +56,32 @@ EX_CONFIG = 78  # the systemd unit does not restart the service on this exit cod
 DEFAULT_ENV_FILE = "/etc/homesec/homesec.env"
 STATIC_NAME = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.-]{0,63}$")  # one file name, no folders
 MAX_VIEWERS = 4  # live views at the same time; every one costs the Pi a JPEG encode per frame
+MODEL_NAME = "yolox_tiny.onnx"
+
+# The 80 object classes the YOLOX model knows (COCO), in model order.
+COCO_NAMES = (
+    "person", "bicycle", "car", "motorcycle", "airplane", "bus", "train", "truck", "boat", "traffic light",
+    "fire hydrant", "stop sign", "parking meter", "bench", "bird", "cat", "dog", "horse", "sheep", "cow",
+    "elephant", "bear", "zebra", "giraffe", "backpack", "umbrella", "handbag", "tie", "suitcase", "frisbee",
+    "skis", "snowboard", "sports ball", "kite", "baseball bat", "baseball glove", "skateboard", "surfboard",
+    "tennis racket", "bottle", "wine glass", "cup", "fork", "knife", "spoon", "bowl", "banana", "apple",
+    "sandwich", "orange", "broccoli", "carrot", "hot dog", "pizza", "donut", "cake", "chair", "couch",
+    "potted plant", "bed", "dining table", "toilet", "tv", "laptop", "mouse", "remote", "keyboard",
+    "cell phone", "microwave", "oven", "toaster", "sink", "refrigerator", "book", "clock", "vase",
+    "scissors", "teddy bear", "hair drier", "toothbrush",
+)
 
 
 def default_static_dir() -> Path:
     """The web console files: the "static" folder next to this file, or where preps.sh installs them."""
     here = Path(__file__).resolve().parent / "static"
     return here if here.is_dir() else Path("/usr/local/share/homesec/static")
+
+
+def default_model_file() -> Path:
+    """The person-check model: in "models" next to this file, or where preps.sh installs it."""
+    here = Path(__file__).resolve().parent / "models" / MODEL_NAME
+    return here if here.is_file() else Path("/usr/local/share/homesec/models") / MODEL_NAME
 
 
 class ConfigError(Exception):
@@ -147,6 +170,30 @@ class _Reader:
             raise ConfigError(f"{key} must be one of {', '.join(options)}, got {value!r}")
         return value
 
+    def flag(self, key: str, default: bool) -> bool:
+        value = self.text(key, "yes" if default else "no").lower()
+        if value in ("yes", "true", "on", "1"):
+            return True
+        if value in ("no", "false", "off", "0"):
+            return False
+        raise ConfigError(f"{key} must be yes or no, got {value!r}")
+
+    def areas(self, key: str) -> tuple:
+        """Rectangles in percent of the picture: "x0,y0,x1,y1; x0,y0,x1,y1". Returned as fractions."""
+        rects = []
+        for part in self.text(key).replace("|", ";").split(";"):
+            if not part.strip():
+                continue
+            try:
+                x0, y0, x1, y1 = (float(v) for v in part.split(","))
+            except ValueError:
+                raise ConfigError(f"{key} must look like 0,0,30,50; 70,0,100,20 (left,top,right,bottom in %), "
+                                  f"got {part.strip()!r}") from None
+            if not (0 <= x0 < x1 <= 100 and 0 <= y0 < y1 <= 100):
+                raise ConfigError(f"{key}: {part.strip()!r} needs 0 <= left < right <= 100 and 0 <= top < bottom <= 100")
+            rects.append((x0 / 100, y0 / 100, x1 / 100, y1 / 100))
+        return tuple(rects)
+
     def size(self, key: str, default: str) -> tuple:
         raw = self.text(key, default).lower()
         try:
@@ -176,8 +223,20 @@ class Config:
     detect_size: tuple
     fps: float
     buffer_count: int
-    threshold: float
+    min_area: float
+    max_area: float
     frames: int
+    mask: tuple
+    object_check: str
+    objects: tuple
+    object_confidence: float
+    object_model: Path
+    recheck: float
+    keep_rejected: bool
+    clip_before: float
+    clip_after: float
+    clip_fps: float
+    clip_width: int
     warmup: float
     cooldown: float
     keep_days: int
@@ -229,10 +288,24 @@ class Config:
         allowed_hosts = tuple(h.strip().lower() for h in r.text("WEB_ALLOWED_HOSTS").split(",") if h.strip())
         static_dir = Path(r.text("STATIC_DIR")) if r.text("STATIC_DIR") else default_static_dir()
 
+        min_area = r.number("MIN_AREA", 1.0, float, 0.1, 100)
+        max_area = r.number("MAX_AREA", 60.0, float, 1, 100)
+        if max_area <= min_area:
+            raise ConfigError("MAX_AREA must be larger than MIN_AREA")
+        if r.text("THRESHOLD"):
+            log.warning("THRESHOLD is no longer used: movement is now measured as the part of the picture that "
+                        "changed (MIN_AREA, in %). Remove THRESHOLD from the settings file.")
+        objects = tuple(o.strip().lower() for o in r.text("OBJECTS", "person").split(",") if o.strip())
+        unknown = [o for o in objects if o not in COCO_NAMES]
+        if unknown or not objects:
+            raise ConfigError(f"OBJECTS: unknown name(s) {', '.join(unknown) or '(empty)'}; use names like "
+                              "person, cat, dog, car (the COCO object names)")
+        object_model = Path(r.text("OBJECT_MODEL")) if r.text("OBJECT_MODEL") else default_model_file()
+
         return cls(
             mail_to=recipients,
             mail_from=mail_from,
-            mail_subject=r.text("MAIL_SUBJECT", "Motion detected", legacy=("SUBJECT",)),
+            mail_subject=r.text("MAIL_SUBJECT", legacy=("SUBJECT",)),  # empty: "Person detected" etc.
             smtp_host=smtp_host,
             smtp_port=r.number("SMTP_PORT", default_port, int, 1, 65535),
             smtp_user=smtp_user,
@@ -246,8 +319,20 @@ class Config:
             detect_size=detect_size,
             fps=r.number("FPS", 5.0, float, 0.5, 30),
             buffer_count=r.number("BUFFER_COUNT", 3, int, 2, 12),
-            threshold=r.number("THRESHOLD", 7.0, float, 0, 65025),
-            frames=r.number("FRAMES", 2, int, 1, 100),
+            min_area=min_area,
+            max_area=max_area,
+            frames=r.number("FRAMES", 3, int, 1, 100),
+            mask=r.areas("MASK"),
+            object_check=r.choice("OBJECT_CHECK", "auto", ("auto", "on", "off")),
+            objects=objects,
+            object_confidence=r.number("OBJECT_CONFIDENCE", 0.5, float, 0.05, 0.99),
+            object_model=object_model,
+            recheck=r.number("RECHECK", 2.0, float, 0, 600),
+            keep_rejected=r.flag("KEEP_REJECTED", False),
+            clip_before=r.number("CLIP_BEFORE", 3.0, float, 0, 10),
+            clip_after=r.number("CLIP_AFTER", 2.0, float, 0, 10),
+            clip_fps=r.number("CLIP_FPS", 2.0, float, 0.5, 10),
+            clip_width=r.number("CLIP_WIDTH", 640, int, 0, 1920),  # 0 = no clip
             warmup=r.number("WARMUP", 5.0, float, 0, 600),
             cooldown=r.number("COOLDOWN", 300.0, float, 1, 86400),
             keep_days=r.number("KEEP_DAYS", 7, int, 1, 3650),
@@ -271,16 +356,17 @@ class Config:
 
 
 def build_message(cfg: Config, image: Optional[Path] = None, subject: Optional[str] = None,
-                  body: Optional[str] = None) -> EmailMessage:
+                  body: Optional[str] = None, extra: tuple = ()) -> EmailMessage:
     msg = EmailMessage()
-    msg["Subject"] = subject or cfg.mail_subject
+    msg["Subject"] = subject or cfg.mail_subject or "Motion detected"
     msg["From"] = cfg.mail_from
     msg["To"] = ", ".join(cfg.mail_to)
     msg["Date"] = formatdate(localtime=True)
     msg["Message-ID"] = make_msgid(domain=socket.gethostname())
     msg.set_content(body or f"Motion detected on {socket.gethostname()} at {datetime.now():%Y-%m-%d %H:%M:%S}.")
-    if image is not None:
-        msg.add_attachment(image.read_bytes(), maintype="image", subtype="jpeg", filename=image.name)
+    for attachment in ((image,) if image is not None else ()) + tuple(extra):
+        subtype = "gif" if attachment.suffix.lower() == ".gif" else "jpeg"
+        msg.add_attachment(attachment.read_bytes(), maintype="image", subtype=subtype, filename=attachment.name)
     return msg
 
 
@@ -351,6 +437,69 @@ class _RetryWorker:
         return str(item)
 
 
+@dataclass(frozen=True)
+class Event:
+    """One alert: the saved picture and why it was sent."""
+
+    path: Path
+    area: float = 0.0          # moving part of the picture, percent
+    label: str = ""            # what the object check saw ("person"); empty without object check
+    confidence: float = 0.0    # how sure the object check is, 0..1
+    when: datetime = field(default_factory=datetime.now)
+    clip: tuple = field(default=(), repr=False, compare=False)  # ((clock time, small RGB frame), ...)
+    clip_t: float = 0.0        # clock time of the alert, to mark it in the clip
+    clip_fps: float = 2.0
+
+    def headline(self) -> str:
+        return f"{self.label.capitalize()} detected" if self.label else "Motion detected"
+
+    def details(self) -> str:
+        parts = [f"movement over {self.area:.1f}% of the picture"]
+        if self.label:
+            parts.insert(0, f"{self.label} {self.confidence:.0%} sure")
+        return ", ".join(parts)
+
+
+def event_body(event: Event, clip: Optional[Path] = None) -> str:
+    text = (f"{event.headline()} on {socket.gethostname()} at {event.when:%Y-%m-%d %H:%M:%S}\n"
+            f"({event.details()}).")
+    if clip is not None and event.clip:
+        first, last = event.clip[0][0] - event.clip_t, event.clip[-1][0] - event.clip_t
+        text += (f"\n\nThe animation ({clip.name}) runs from {-first:.0f} s before to {last:.0f} s after the alert; "
+                 "frames from the alert on have a red border.")
+    return text
+
+
+def write_clip(path: Path, event: Event) -> Path:
+    """The frames around an alert as an animated GIF, with the time on each frame and a red border from
+    the moment of the alert. Written under a temporary name first, so the web page never shows half."""
+    from PIL import Image, ImageDraw, ImageFont
+
+    height, width = event.clip[0][1].shape[:2]
+    try:
+        font = ImageFont.load_default(size=max(12, width // 36))
+    except TypeError:  # Pillow before 10.1 has one small font only
+        font = ImageFont.load_default()
+    adaptive = getattr(Image, "Palette", Image).ADAPTIVE
+    images = []
+    for t, rgb in event.clip:
+        image = Image.fromarray(rgb)
+        draw = ImageDraw.Draw(image)
+        offset = t - event.clip_t
+        label = f"{event.when + timedelta(seconds=offset):%H:%M:%S}  {offset:+.1f}s"
+        x0, y0, x1, y1 = draw.textbbox((6, 4), label, font=font)
+        draw.rectangle((0, 0, x1 + 6, y1 + 4), fill=(0, 0, 0))
+        draw.text((6, 4), label, fill=(255, 255, 255), font=font)
+        if offset >= -1e-6:
+            draw.rectangle((0, 0, width - 1, height - 1), outline=(230, 40, 40), width=max(3, width // 160))
+        images.append(image.convert("P", palette=adaptive, colors=192))
+    tmp = path.with_name(path.name + ".tmp")
+    images[0].save(tmp, format="GIF", save_all=True, append_images=images[1:],
+                   duration=int(1000 / event.clip_fps), loop=0)
+    tmp.replace(path)
+    return path
+
+
 class Mailer(_RetryWorker):
     """Mails pictures."""
 
@@ -359,12 +508,23 @@ class Mailer(_RetryWorker):
     def __init__(self, cfg: Config, sender: Callable = send_message):
         super().__init__(cfg, sender)
 
-    def _deliver_once(self, image: Path) -> None:
-        self._send(self._cfg, build_message(self._cfg, image))
-        log.info("mailed %s to %s", image.name, ", ".join(self._cfg.mail_to))
+    def _deliver_once(self, event: Event) -> None:
+        clip = None
+        if event.clip:
+            clip = event.path.with_suffix(".gif")
+            if not clip.exists():  # made once, also when the mail is retried
+                try:
+                    write_clip(clip, event)
+                except Exception as exc:  # no clip is better than no mail
+                    log.warning("could not make the clip %s: %s", clip.name, exc)
+                    clip = None
+        msg = build_message(self._cfg, event.path, subject=self._cfg.mail_subject or event.headline(),
+                            body=event_body(event, clip), extra=(clip,) if clip else ())
+        self._send(self._cfg, msg)
+        log.info("mailed %s to %s", event.path.name, ", ".join(self._cfg.mail_to))
 
-    def _describe(self, image: Path) -> str:
-        return f"{image.name} (the picture stays in {self._cfg.image_dir})"
+    def _describe(self, event: Event) -> str:
+        return f"{event.path.name} (the picture stays in {self._cfg.image_dir})"
 
 
 # ---------------------------------------------------------------------------- slack
@@ -406,12 +566,16 @@ def post_slack(cfg: Config, text: str) -> None:
         _slack_post(cfg.slack_webhook, {"text": text})
 
 
-def slack_text(cfg: Config, image: Optional[Path], score: float) -> str:
+def slack_text(cfg: Config, event: Event) -> str:
     host = socket.gethostname()
-    text = f":rotating_light: *Motion detected* on `{host}` at {datetime.now():%Y-%m-%d %H:%M:%S} (score {score:.1f})"
-    if image is not None and cfg.web_port:
+    text = (f":rotating_light: *{event.headline()}* on `{host}` at {event.when:%Y-%m-%d %H:%M:%S} "
+            f"({event.details()})")
+    if cfg.web_port:
         base = cfg.web_url or f"http://{host}.local:{cfg.web_port}"
-        text += f"\n<{base}/pictures/{image.name}|View picture>  ·  <{base}/|Open console>"
+        links = [f"<{base}/pictures/{event.path.name}|View picture>"]
+        if cfg.clip_width:
+            links.append(f"<{base}/pictures/{event.path.stem}.gif|View clip>")
+        text += "\n" + "  ·  ".join(links + [f"<{base}/|Open console>"])
     return text
 
 
@@ -445,6 +609,12 @@ def describe_camera_error(exc: Exception, cfg: Config) -> str:
     return f"camera setup failed: {exc}"
 
 
+def shrink_rgb(bgr: np.ndarray, width: int) -> np.ndarray:
+    """A small RGB copy of a BGR picture (every n-th pixel; plenty for an alert clip)."""
+    step = max(1, round(bgr.shape[1] / width))
+    return np.ascontiguousarray(bgr[::step, ::step, 2::-1])
+
+
 class PiCamera:
     """Raspberry Pi camera (ribbon cable, and USB cameras libcamera supports) via picamera2.
 
@@ -468,6 +638,8 @@ class PiCamera:
             ) from None
         self._cfg = cfg
         self._width, self._height = cfg.detect_size
+        self.color_width = 0  # when set, read_gray also keeps a small colour copy in .color
+        self.color: Optional[np.ndarray] = None
         try:
             model = str(self._cam.camera_properties.get("Model", "")).upper()  # e.g. IMX477
         except Exception:  # not every camera reports a model
@@ -501,7 +673,13 @@ class PiCamera:
             raise CameraError(describe_camera_error(exc, self._cfg)) from None
 
     def read_gray(self) -> np.ndarray:
-        buf = self._cam.capture_buffer("lores")
+        request = self._cam.capture_request()  # both streams of the same frame
+        try:
+            buf = request.make_buffer("lores")
+            # "RGB888" arrives in B, G, R order
+            self.color = shrink_rgb(request.make_array("main"), self.color_width) if self.color_width else None
+        finally:
+            request.release()
         plane = buf[: self._stride * self._height].reshape(self._height, self._stride)
         return np.ascontiguousarray(plane[:, : self._width])
 
@@ -536,6 +714,8 @@ class UsbCamera:
         self._detect_size = cfg.detect_size
         self._quality = cfg.jpeg_quality
         self._last = None
+        self.color_width = 0
+        self.color: Optional[np.ndarray] = None
         device = int(cfg.video_device) if cfg.video_device.isdigit() else cfg.video_device
         self._cap = cv2.VideoCapture(device)
         if not self._cap.isOpened():
@@ -552,6 +732,7 @@ class UsbCamera:
         if not ok or frame is None:
             raise CameraError("the USB camera returned no picture")
         self._last = frame
+        self.color = shrink_rgb(frame, self.color_width) if self.color_width else None
         gray = self._cv2.cvtColor(frame, self._cv2.COLOR_BGR2GRAY)
         return self._cv2.resize(gray, self._detect_size, interpolation=self._cv2.INTER_AREA)
 
@@ -591,39 +772,275 @@ def open_camera(cfg: Config):
 # ------------------------------------------------------------------ motion detection
 
 
-class MotionDetector:
-    """Frame differencing: mean squared grey-level change between two successive small frames.
+@dataclass(frozen=True)
+class MotionResult:
+    moving: bool                 # movement seen in enough successive frames
+    area: float                  # largest moving region, percent of the watched picture
+    changed: float               # all changed blocks together, percent
+    box: Optional[tuple] = None  # (left, top, right, bottom) of the largest region, fractions 0..1
+    reason: str = ""             # why nothing counts: "learning", "light change"
 
-    Slow changes (daylight, auto exposure) change little between frames and are ignored.
-    Movement must be seen in `frames_needed` successive frames, which filters out flicker.
+
+class MotionDetector:
+    """Finds things that move, not light that changes.
+
+    The small grey picture is halved (less noise) and cut into blocks of 8x8. Every block is compared
+    with a background picture that slowly follows the scene. Per block, the brightness and any smooth
+    light gradient are removed first, so only the pattern is compared (normalised correlation): a
+    blue light on the wall, a lamp, the camera adjusting its exposure make the pattern brighter or
+    darker but do not change it. A person walking in front of the wall does.
+
+    Changed blocks that touch form a region. Movement is reported when the largest region covers at
+    least min_area percent of the picture in `frames_needed` successive frames. When more than
+    max_area percent changes at once (lights on/off, camera bumped), the background starts over.
+    The noise level is measured continuously, so grain at night does not count as a pattern.
     """
 
-    def __init__(self, threshold: float, frames_needed: int):
-        self.threshold = threshold
+    BLOCK = 8              # block size in pixels, after halving the detection picture
+    TEXTURE = 2.5          # grey levels: flatter than this (or than 2.5x the noise) has no pattern
+    MATCH = 0.5            # pattern correlation below this means the block changed
+    ADAPT = 0.08           # background follows quiet blocks quickly (about 2.5 s at 5 fps)
+    ADAPT_CHANGED = 0.02   # ... and changed blocks slowly (about 10 s), so a parked object fades in
+
+    def __init__(self, min_area: float = 1.0, max_area: float = 60.0, frames_needed: int = 3,
+                 mask: tuple = ()):
+        self.min_area = min_area
+        self.max_area = max_area
         self.frames_needed = frames_needed
-        self._previous: Optional[np.ndarray] = None
+        self.mask = tuple(mask)
+        self.noise: Optional[float] = None
+        self._bg: Optional[np.ndarray] = None
+        self._hits = 0
+        self._grid = (0, 0)
+        self._watched: Optional[np.ndarray] = None
+        self._basis: tuple = ()
+
+    def reset(self) -> None:
+        self._bg = None
         self._hits = 0
 
-    def update(self, gray: np.ndarray) -> tuple:
-        """Returns (motion, score). int32 so the squared difference cannot overflow."""
-        current = gray.astype(np.int32)
-        previous, self._previous = self._previous, current
-        if previous is None:
-            return False, 0.0
-        diff = current - previous
-        score = float(np.mean(diff * diff))
-        self._hits = self._hits + 1 if score > self.threshold else 0
-        if self._hits >= self.frames_needed:
+    def _prepare(self, gray: np.ndarray) -> np.ndarray:
+        g = gray.astype(np.float32)
+        h, w = g.shape
+        g = g[: h - h % 2, : w - w % 2]
+        g = (g[0::2, 0::2] + g[1::2, 0::2] + g[0::2, 1::2] + g[1::2, 1::2]) * 0.25
+        b = self.BLOCK
+        h, w = g.shape
+        return g[: h - h % b, : w - w % b]
+
+    def _blocks(self, img: np.ndarray) -> np.ndarray:
+        b = self.BLOCK
+        rows, cols = img.shape[0] // b, img.shape[1] // b
+        return img.reshape(rows, b, cols, b).transpose(0, 2, 1, 3).reshape(rows, cols, b * b)
+
+    def _setup(self, img: np.ndarray) -> None:
+        b = self.BLOCK
+        rows, cols = img.shape[0] // b, img.shape[1] // b
+        self._grid = (rows, cols)
+        c = np.arange(b, dtype=np.float32) - (b - 1) / 2
+        x, y = np.tile(c, b), np.repeat(c, b)
+        self._basis = (x / np.dot(x, x), x, y / np.dot(y, y), y)
+        watched = np.ones((rows, cols), bool)
+        for x0, y0, x1, y1 in self.mask:  # MASK areas are ignored
+            watched[int(y0 * rows):int(np.ceil(y1 * rows)), int(x0 * cols):int(np.ceil(x1 * cols))] = False
+        self._watched = watched
+
+    def _pattern(self, blocks: np.ndarray) -> np.ndarray:
+        """Each block minus its mean brightness and its smooth slope: what is left is its pattern."""
+        xs, x, ys, y = self._basis
+        p = blocks - blocks.mean(axis=2, keepdims=True)
+        p = p - (p @ xs)[..., None] * x
+        return p - (p @ ys)[..., None] * y
+
+    def update(self, gray: np.ndarray) -> MotionResult:
+        img = self._prepare(gray)
+        if self._bg is None or self._bg.shape != img.shape:
+            self._setup(img)
+            self._bg = img.copy()
             self._hits = 0
-            return True, score
-        return False, score
+            self.noise = noise_level(img)
+            return MotionResult(False, 0.0, 0.0, reason="learning")
+        self.noise = 0.8 * self.noise + 0.2 * noise_level(img)
+        cur = self._pattern(self._blocks(img))
+        ref = self._pattern(self._blocks(self._bg))
+        n = cur.shape[2]
+        var_c = np.einsum("ijk,ijk->ij", cur, cur) / n
+        var_r = np.einsum("ijk,ijk->ij", ref, ref) / n
+        cov = np.einsum("ijk,ijk->ij", cur, ref) / n
+        floor = max(self.TEXTURE, 2.5 * self.noise) ** 2
+        # Only a block that shows a pattern now can show something new. A pattern that sank into the
+        # dark and the noise (lights out), or a flat wall that stayed flat, is not movement.
+        visible = var_c >= floor
+        match = cov / np.sqrt(var_c * np.maximum(var_r, floor) + 1e-6)
+        changed = visible & (match < self.MATCH) & self._watched
+
+        rate = np.where(changed, self.ADAPT_CHANGED, self.ADAPT).astype(np.float32)
+        b = self.BLOCK
+        self._bg += np.repeat(np.repeat(rate, b, axis=0), b, axis=1) * (img - self._bg)
+
+        total = max(1, int(self._watched.sum()))
+        changed_pct = 100.0 * int(changed.sum()) / total
+        if changed_pct > self.max_area:
+            self._bg = img.copy()
+            self._hits = 0
+            return MotionResult(False, 0.0, changed_pct, reason="light change")
+        size, box = largest_region(changed)
+        area = 100.0 * size / total
+        self._hits = self._hits + 1 if area >= self.min_area else 0
+        moving = self._hits >= self.frames_needed
+        if moving:
+            self._hits = 0
+        rows, cols = self._grid
+        frac = None if box is None else (box[1] / cols, box[0] / rows, (box[3] + 1) / cols, (box[2] + 1) / rows)
+        return MotionResult(moving, area, changed_pct, frac)
+
+
+def noise_level(img: np.ndarray) -> float:
+    """Camera noise (standard deviation in grey levels) estimated from the picture itself: the median
+    of a 3x3 second-derivative filter. Smooth surfaces and soft light give about 0, grain does not,
+    and the median ignores the few sharp edges."""
+    lap = (img[:-2, :-2] - 2 * img[:-2, 1:-1] + img[:-2, 2:]
+           - 2 * img[1:-1, :-2] + 4 * img[1:-1, 1:-1] - 2 * img[1:-1, 2:]
+           + img[2:, :-2] - 2 * img[2:, 1:-1] + img[2:, 2:])
+    return float(np.median(np.abs(lap))) * 1.4826 / 6.0
+
+
+def largest_region(cells: np.ndarray) -> tuple:
+    """Size and (row0, col0, row1, col1) of the largest group of touching True cells (8 neighbours)."""
+    rows, cols = cells.shape
+    seen = np.zeros_like(cells)
+    best, best_box = 0, None
+    for r0, c0 in zip(*np.nonzero(cells)):
+        if seen[r0, c0]:
+            continue
+        seen[r0, c0] = True
+        stack = [(r0, c0)]
+        size, top, left, bottom, right = 0, r0, c0, r0, c0
+        while stack:
+            r, c = stack.pop()
+            size += 1
+            top, bottom, left, right = min(top, r), max(bottom, r), min(left, c), max(right, c)
+            for rr in (r - 1, r, r + 1):
+                for cc in (c - 1, c, c + 1):
+                    if 0 <= rr < rows and 0 <= cc < cols and cells[rr, cc] and not seen[rr, cc]:
+                        seen[rr, cc] = True
+                        stack.append((rr, cc))
+        if size > best:
+            best, best_box = size, (int(top), int(left), int(bottom), int(right))
+    return best, best_box
+
+
+# ---------------------------------------------------------------------- object check
+
+
+@dataclass(frozen=True)
+class Found:
+    label: str
+    confidence: float
+    box: tuple  # (left, top, right, bottom), fractions of the picture
+
+
+class ObjectCheck:
+    """Looks for a person (or other OBJECTS) in a picture with the YOLOX-tiny model via OpenCV.
+
+    Run only when the motion detector reports movement, on the full picture and, when the movement
+    is small, once more on a crop around it (far-away people are small).
+    """
+
+    SIZE = 416  # model input, pixels
+
+    def __init__(self, model: Path, objects: tuple = ("person",), confidence: float = 0.5):
+        try:
+            import cv2
+        except ImportError as exc:
+            raise ConfigError(f"the object check needs OpenCV ({exc}); run: sudo apt install python3-opencv") from None
+        if not model.is_file():
+            raise ConfigError(f"model file {model} not found; run ./preps.sh again, which downloads it")
+        self._cv2 = cv2
+        try:
+            self._net = cv2.dnn.readNetFromONNX(str(model))
+        except Exception as exc:  # cv2.error
+            raise ConfigError(f"cannot load the model {model}: {exc}") from None
+        self.objects = tuple(objects)
+        self.confidence = confidence
+        self._ids = np.array([COCO_NAMES.index(o) for o in objects])
+        grids, strides = [], []
+        for stride in (8, 16, 32):
+            n = self.SIZE // stride
+            xv, yv = np.meshgrid(np.arange(n), np.arange(n))
+            grids.append(np.stack((xv, yv), 2).reshape(-1, 2))
+            strides.append(np.full((n * n, 1), stride))
+        self._grid = np.concatenate(grids).astype(np.float32)
+        self._stride = np.concatenate(strides).astype(np.float32)
+
+    def _detect(self, image: np.ndarray) -> Optional[Found]:
+        """Best match in a BGR picture, or None."""
+        cv2, size = self._cv2, self.SIZE
+        h, w = image.shape[:2]
+        scale = min(size / h, size / w)
+        canvas = np.full((size, size, 3), 114, np.uint8)
+        canvas[: int(h * scale), : int(w * scale)] = cv2.resize(image, (int(w * scale), int(h * scale)))
+        self._net.setInput(cv2.dnn.blobFromImage(canvas))
+        out = self._net.forward()[0]  # rows: cx, cy, w, h, objectness, 80 class scores
+        scores = out[:, 4:5] * out[:, 5:][:, self._ids]
+        row, col = np.unravel_index(int(np.argmax(scores)), scores.shape)
+        best = float(scores[row, col])
+        if best < self.confidence:
+            return None
+        cx, cy = (out[row, :2] + self._grid[row]) * self._stride[row]
+        bw, bh = np.exp(out[row, 2:4]) * self._stride[row]
+        box = ((cx - bw / 2) / scale / w, (cy - bh / 2) / scale / h, (cx + bw / 2) / scale / w, (cy + bh / 2) / scale / h)
+        return Found(self.objects[col], best, tuple(float(min(1.0, max(0.0, v))) for v in box))
+
+    def find(self, image: np.ndarray, near: Optional[tuple] = None) -> Optional[Found]:
+        found = self._detect(image)
+        if found is not None or near is None:
+            return found
+        x0, y0, x1, y1 = near
+        if x1 - x0 > 0.5 and y1 - y0 > 0.5:
+            return None  # large movement: the full picture was enough
+        h, w = image.shape[:2]
+        side = max(x1 - x0, y1 - y0) * 2.5  # some room around the movement, at least a third of the picture
+        half_w, half_h = max(side, 1 / 3) * w / 2, max(side, 1 / 3) * h / 2
+        cx, cy = (x0 + x1) / 2 * w, (y0 + y1) / 2 * h
+        left, top = int(max(0, cx - half_w)), int(max(0, cy - half_h))
+        right, bottom = int(min(w, cx + half_w)), int(min(h, cy + half_h))
+        found = self._detect(image[top:bottom, left:right])
+        if found is None:
+            return None
+        bx0, by0, bx1, by1 = found.box
+        cw, ch = right - left, bottom - top
+        box = ((left + bx0 * cw) / w, (top + by0 * ch) / h, (left + bx1 * cw) / w, (top + by1 * ch) / h)
+        return Found(found.label, found.confidence, box)
+
+    def find_in_file(self, path: Path, near: Optional[tuple] = None) -> Optional[Found]:
+        image = self._cv2.imread(str(path))
+        if image is None:
+            raise OSError(f"cannot read the picture {path}")
+        return self.find(image, near)
+
+
+def open_object_check(cfg: Config) -> Optional[ObjectCheck]:
+    """The object check, or None when it is off. With OBJECT_CHECK=auto a missing OpenCV or model
+    only gives a warning: then every movement is alerted, as before."""
+    if cfg.object_check == "off":
+        return None
+    try:
+        check = ObjectCheck(cfg.object_model, cfg.objects, cfg.object_confidence)
+    except ConfigError as exc:
+        if cfg.object_check == "on":
+            raise
+        log.warning("object check not available (%s); alerting on every movement", exc)
+        return None
+    log.info("object check on: alerting only for %s (model %s)", ", ".join(cfg.objects), cfg.object_model.name)
+    return check
 
 
 def prune(image_dir: Path, keep_days: int) -> int:
     """Delete pictures older than keep_days so the SD card does not fill up."""
     cutoff = time.time() - keep_days * 86400
     removed = 0
-    for path in image_dir.glob("*.jpg"):
+    for path in [*image_dir.glob("*.jpg"), *image_dir.glob("*.gif"), *image_dir.glob("rejected/*.jpg")]:
         try:
             if path.stat().st_mtime < cutoff:
                 path.unlink()
@@ -633,23 +1050,68 @@ def prune(image_dir: Path, keep_days: int) -> int:
     return removed
 
 
+class ClipRecorder:
+    """Keeps the last `before` seconds as small frames, and after an alert collects `after` seconds
+    more; then hands the whole sequence over (to the mailer, which turns it into a GIF)."""
+
+    def __init__(self, before: float, after: float, fps: float):
+        self.before = before
+        self.after = after
+        self.interval = 1.0 / fps
+        self._ring: deque = deque()
+        self._next = float("-inf")
+        self._open: list = []  # [until, frames, done]
+
+    def due(self, t: float) -> bool:
+        return t >= self._next
+
+    def add(self, t: float, frame: np.ndarray) -> None:
+        late = t - self._next
+        self._next = self._next + self.interval if 0 <= late < self.interval else t + self.interval
+        self._ring.append((t, frame))
+        while self._ring and self._ring[0][0] < t - self.before - 1e-6:
+            self._ring.popleft()
+        for clip in self._open:
+            clip[1].append((t, frame))
+        self._finish([c for c in self._open if t >= c[0] - 1e-6])
+
+    def start(self, t: float, done: Callable) -> None:
+        clip = [t + self.after, list(self._ring), done]
+        self._open.append(clip)
+        if self.after <= 0:
+            self._finish([clip])
+
+    def flush(self) -> None:
+        """Hand over the clips in progress as they are (when pausing or stopping)."""
+        self._finish(list(self._open))
+
+    def _finish(self, clips: list) -> None:
+        for clip in clips:
+            self._open.remove(clip)
+            clip[2](tuple(clip[1]))
+
+
 class Watcher:
-    """One detection step per camera frame; mails a picture on movement."""
+    """One detection step per camera frame; alerts with a picture when something moves."""
 
     def __init__(self, cfg: Config, camera, mailer: Mailer,
                  clock: Callable = time.monotonic, now: Callable = datetime.now,
-                 control: Optional["Control"] = None, slack: Optional["SlackNotifier"] = None):
+                 control: Optional["Control"] = None, slack: Optional["SlackNotifier"] = None,
+                 check: Optional[ObjectCheck] = None):
         self.cfg = cfg
         self.camera = camera
         self.mailer = mailer
         self.control = control
         self.slack = slack
-        self.last_score = 0.0  # for the motion meter on the web page
-        self.detector = MotionDetector(cfg.threshold, cfg.frames)
+        self.check = check
+        self.last_score = 0.0  # moving part of the picture in percent, for the meter on the web page
+        self.detector = MotionDetector(cfg.min_area, cfg.max_area, cfg.frames, cfg.mask)
+        self.recorder = ClipRecorder(cfg.clip_before, cfg.clip_after, cfg.clip_fps) if cfg.clip_width else None
         self._clock = clock
         self._now = now
         self._started = clock()
         self._last_trigger: Optional[float] = None
+        self._last_check: Optional[float] = None
         self._was_paused = False
 
     def step(self) -> Optional[Path]:
@@ -657,32 +1119,84 @@ class Watcher:
             if not self._was_paused:
                 log.info("detection paused")
                 self._was_paused = True
+                self.flush()
             self.last_score = 0.0
             return None  # frames are not even read
         if self._was_paused:
             log.info("detection resumed")
             self._was_paused = False
-            self.detector = MotionDetector(self.cfg.threshold, self.cfg.frames)  # old frame is stale
+            self.detector.reset()  # the background is stale
         t = self._clock()
-        moved, score = self.detector.update(self.camera.read_gray())
-        self.last_score = score
-        if not moved:
+        grab = self.recorder is not None and self.recorder.due(t)
+        if grab:
+            self.camera.color_width = self.cfg.clip_width
+        try:
+            gray = self.camera.read_gray()
+        finally:
+            if grab:
+                self.camera.color_width = 0
+        frame = getattr(self.camera, "color", None) if grab else None
+        if frame is not None:
+            self.recorder.add(t, frame)
+        result = self.detector.update(gray)
+        self.last_score = result.area
+        if result.reason == "light change":
+            log.debug("light change over %.0f%% of the picture ignored", result.changed)
+        if not result.moving:
             return None
         if t - self._started < self.cfg.warmup:
-            log.debug("motion (score %.1f) ignored during warm-up", score)
+            log.debug("movement (%.1f%%) ignored during warm-up", result.area)
             return None
         if self._last_trigger is not None and t - self._last_trigger < self.cfg.cooldown:
-            log.debug("motion (score %.1f) ignored, cooldown active", score)
+            log.debug("movement (%.1f%%) ignored, cooldown active", result.area)
             return None
-        path = self.cfg.image_dir / f"{self._now():%Y-%m-%d_%H%M%S}.jpg"
+        if self.check is not None and self._last_check is not None and t - self._last_check < self.cfg.recheck:
+            return None  # checked a moment ago; do not keep the CPU busy during a long light show
+        stamp = self._now()
+        path = self.cfg.image_dir / f"{stamp:%Y-%m-%d_%H%M%S}.jpg"
         self.camera.capture(path)
+        found = None
+        if self.check is not None:
+            self._last_check = t
+            try:
+                found = self.check.find_in_file(path, result.box)
+            except Exception as exc:  # a failing check must not silence the alarm
+                log.error("object check failed (%s); alerting anyway", exc)
+            else:
+                if found is None:
+                    log.info("movement over %.1f%% of the picture, but no %s seen: no alert",
+                             result.area, " or ".join(self.check.objects))
+                    self._reject(path)
+                    return None
+        event = Event(path, result.area, found.label if found else "", found.confidence if found else 0.0, stamp)
         self._last_trigger = t
-        log.info("motion (score %.1f), saved %s", score, path.name)
-        self.mailer.submit(path)
+        log.info("%s (%s), saved %s", event.headline().lower(), event.details(), path.name)
+        if self.recorder is not None:  # the mail goes out when the clip is complete, `CLIP_AFTER` seconds on
+            self.recorder.start(t, lambda frames, e=event: self.mailer.submit(
+                replace(e, clip=frames, clip_t=t, clip_fps=self.cfg.clip_fps)))
+        else:
+            self.mailer.submit(event)
         if self.slack is not None:
-            self.slack.submit(slack_text(self.cfg, path, score))
+            self.slack.submit(slack_text(self.cfg, event))
         prune(self.cfg.image_dir, self.cfg.keep_days)
         return path
+
+    def flush(self) -> None:
+        """Send alerts whose clip is still being recorded now (pause, shutdown)."""
+        if self.recorder is not None:
+            self.recorder.flush()
+
+    def _reject(self, path: Path) -> None:
+        """Keep the picture of a rejected movement in rejected/ (KEEP_REJECTED=yes), else delete it."""
+        try:
+            if self.cfg.keep_rejected:
+                target = path.parent / "rejected"
+                target.mkdir(exist_ok=True)
+                path.replace(target / path.name)
+            else:
+                path.unlink()
+        except OSError as exc:
+            log.warning("could not move or remove %s: %s", path.name, exc)
 
 
 # ------------------------------------------------------------------------ web console
@@ -707,6 +1221,7 @@ class Control:
 
 
 EVENT_NAME = re.compile(r"^\d{4}-\d{2}-\d{2}_\d{6}\.jpg$")
+MEDIA_NAME = re.compile(r"^\d{4}-\d{2}-\d{2}_\d{6}\.(jpg|gif)$")
 EVENT_FORMAT = "%Y-%m-%d_%H%M%S"
 
 
@@ -779,10 +1294,12 @@ class FrameHub:
 class App:
     """What the web console can see and change."""
 
-    def __init__(self, cfg: Config, control: Control, backend: str = "", names_ttl: float = 2.0):
+    def __init__(self, cfg: Config, control: Control, backend: str = "", names_ttl: float = 2.0,
+                 objects: tuple = ()):
         self.cfg = cfg
         self.control = control
         self.backend = backend
+        self.objects = objects  # what the object check looks for; empty when it is off
         self.hub = FrameHub()
         self.started = time.time()
         self.score = 0.0  # latest motion score, written by the detection loop
@@ -804,7 +1321,8 @@ class App:
         return {
             "detection": "paused" if self.control.paused else "on",
             "score": round(self.score, 2),
-            "threshold": cfg.threshold,
+            "threshold": cfg.min_area,
+            "check": {"enabled": bool(self.objects), "objects": list(self.objects)},
             "events_today": sum(n.startswith(today) for n in names),
             "last_motion": describe_event(names[0]) if names else None,
             "camera": self.backend,
@@ -818,7 +1336,14 @@ class App:
         }
 
     def events(self, limit: int = 30) -> list:
-        return [describe_event(n) for n in self.names()[:limit]]
+        events = []
+        for name in self.names()[:limit]:
+            event = describe_event(name)
+            clip = name[:-4] + ".gif"
+            if (self.cfg.image_dir / clip).is_file():
+                event["clip"] = f"/pictures/{clip}"
+            events.append(event)
+        return events
 
 
 def host_allowed(host_header: str, extra: tuple = ()) -> bool:
@@ -902,13 +1427,14 @@ def make_handler(app: App):
             self._send(200, data, ctype, "no-cache")
 
         def _picture(self, name: str) -> None:
-            if not EVENT_NAME.match(name):  # no slashes or dots: nothing outside the picture folder
+            if not MEDIA_NAME.match(name):  # no slashes, one dot: nothing outside the picture folder
                 return self._send(404, b"not found")
             try:
                 data = (cfg.image_dir / name).read_bytes()
             except OSError:
                 return self._send(404, b"not found")
-            self._send(200, data, "image/jpeg", "private, max-age=3600")
+            ctype = "image/gif" if name.endswith(".gif") else "image/jpeg"
+            self._send(200, data, ctype, "private, max-age=3600")
 
         def _client_gone(self) -> bool:
             """True when the viewer closed the connection. Needed because with no new pictures there is
@@ -1006,15 +1532,18 @@ def cmd_run(cfg: Config) -> int:
     control = Control(cfg.image_dir / ".paused")
     if control.paused:
         log.info("starting with detection paused (use the web page to resume)")
+    check = open_object_check(cfg)
     camera = open_camera(cfg)
-    app = App(cfg, control, getattr(camera, "label", getattr(camera, "NAME", "")))
+    app = App(cfg, control, getattr(camera, "label", getattr(camera, "NAME", "")),
+              objects=check.objects if check else ())
     server = None
+    watcher = None
     try:
         camera.start()
         server = start_web(app)
-        watcher = Watcher(cfg, camera, mailer, control=control, slack=slack)
-        log.info("watching for movement (%.1f fps, threshold %.1f, cooldown %ds), mailing to %s%s",
-                 cfg.fps, cfg.threshold, cfg.cooldown, ", ".join(cfg.mail_to), " and posting to Slack" if slack else "")
+        watcher = Watcher(cfg, camera, mailer, control=control, slack=slack, check=check)
+        log.info("watching for movement (%.1f fps, min. area %.1f%%, cooldown %ds), mailing to %s%s",
+                 cfg.fps, cfg.min_area, cfg.cooldown, ", ".join(cfg.mail_to), " and posting to Slack" if slack else "")
         interval = 1.0 / cfg.fps
         view_failed = False
         while not stop.is_set():
@@ -1037,6 +1566,8 @@ def cmd_run(cfg: Config) -> int:
             server.shutdown()
             server.server_close()
         camera.close()
+        if watcher is not None:
+            watcher.flush()
         mailer.close()
         if slack:
             slack.close()
@@ -1077,6 +1608,21 @@ def cmd_snapshot(cfg: Config) -> int:
     return 0
 
 
+def cmd_check(cfg: Config, image: Optional[str]) -> int:
+    if not image:
+        raise ConfigError("give a picture: homesec check /var/lib/homesec/2026-11-08_031502.jpg")
+    check = ObjectCheck(cfg.object_model, cfg.objects, cfg.object_confidence)
+    began = time.monotonic()
+    found = check.find_in_file(Path(image))
+    took = time.monotonic() - began
+    if found is None:
+        print(f"no {' or '.join(check.objects)} found (confidence {cfg.object_confidence:.0%} needed, {took:.2f} s)")
+        return 1
+    box = ", ".join(f"{v:.0%}" for v in found.box)
+    print(f"{found.label}, {found.confidence:.0%} sure, at {box} (left, top, right, bottom; {took:.2f} s)")
+    return 0
+
+
 def cmd_mailtest(cfg: Config) -> int:
     msg = build_message(cfg, subject="homeSec test mail",
                         body=f"If you read this, homeSec on {socket.gethostname()} can send mail.")
@@ -1091,9 +1637,12 @@ def cmd_mailtest(cfg: Config) -> int:
 
 def main(argv: Optional[list] = None) -> int:
     parser = argparse.ArgumentParser(prog="homesec", description="Mail a picture when the camera sees movement.")
-    parser.add_argument("command", nargs="?", default="run", choices=("run", "snapshot", "mailtest", "slacktest"),
+    parser.add_argument("command", nargs="?", default="run",
+                        choices=("run", "snapshot", "mailtest", "slacktest", "check"),
                         help="run (default): watch, mail and post to Slack; snapshot: mail one picture now; "
-                             "mailtest / slacktest: send a test mail / Slack message")
+                             "mailtest / slacktest: send a test mail / Slack message; "
+                             "check IMAGE: run the person check on a picture")
+    parser.add_argument("image", nargs="?", help="picture for the check command")
     parser.add_argument("--env", metavar="FILE", help=f"settings file (default: first of $HOMESEC_ENV, ./.env, {DEFAULT_ENV_FILE})")
     parser.add_argument("-v", "--verbose", action="store_true", help="show debug messages")
     args = parser.parse_args(argv)
@@ -1105,12 +1654,14 @@ def main(argv: Optional[list] = None) -> int:
         cfg = Config.load(args.env)
         if not args.verbose:
             logging.getLogger().setLevel(cfg.log_level.upper())
+        if args.command == "check":
+            return cmd_check(cfg, args.image)
         return {"run": cmd_run, "snapshot": cmd_snapshot, "mailtest": cmd_mailtest,
                 "slacktest": cmd_slacktest}[args.command](cfg)
     except ConfigError as exc:
         log.error("settings: %s", exc)
         return EX_CONFIG
-    except CameraError as exc:
+    except (CameraError, OSError) as exc:
         log.error("%s", exc)
         return 1
 

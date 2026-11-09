@@ -170,8 +170,8 @@
 
   // ---------- event log
   function openPicture(event) {
-    el.lightboxImg.src = event.url;
-    el.lightboxCaption.textContent = `${event.date}  ${event.time}`;
+    el.lightboxImg.src = event.clip || event.url;  // the clip (seconds before and after) when there is one
+    el.lightboxCaption.textContent = `${event.date}  ${event.time}${event.clip ? '  · clip' : ''}`;
     el.lightbox.showModal();
   }
   el.lightbox.addEventListener('click', (e) => { if (e.target === el.lightbox) el.lightbox.close(); });
@@ -238,8 +238,8 @@
     el.meterFill.style.clipPath = `inset(0 ${100 - pct}% 0 0)`;
     el.meter.style.opacity = paused ? '0.35' : '1';
     el.meter.setAttribute('aria-valuenow', String(Math.round(pct)));
-    el.score.textContent = s.score.toFixed(2);
-    el.threshold.textContent = String(s.threshold);
+    el.score.textContent = `${s.score.toFixed(1)}%`;
+    el.threshold.textContent = `${s.threshold}%`;
 
     const hot = !paused && s.score > s.threshold;
     el.stage.classList.toggle('alert', hot);
@@ -258,7 +258,8 @@
     const targets = [];
     if (s.slack.enabled) targets.push(s.slack.channel ? `Slack ${s.slack.channel}` : 'Slack');
     targets.push('Mail');
-    el.alerts.textContent = `Alerts → ${targets.join(' · ')}`;
+    const only = s.check && s.check.enabled ? ` · only for ${s.check.objects.join(', ')}` : '';
+    el.alerts.textContent = `Alerts → ${targets.join(' · ')}${only}`;
 
     const key = `${s.events_today}|${s.last_motion ? s.last_motion.name : ''}`;
     if (key !== eventsKey) {

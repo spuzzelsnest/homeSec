@@ -2,25 +2,30 @@
 
 homeSec is a small Raspberry Pi service: a camera watches a room, and when something moves homeSec mails you a picture.
 
-It is one Python file (`homesec.py`) with no extra software: the camera is read with [picamera2](https://github.com/raspberrypi/picamera2), movement is detected with numpy, and mail is sent with Python's `smtplib`. Earlier versions needed `motion`, `fswebcam`, `mutt`, `msmtp` and `inotify-tools`; those are gone.
+It is one Python file (`homesec.py`) with no extra software: the camera is read with [picamera2](https://github.com/raspberrypi/picamera2), movement is detected with numpy, a small AI model checks with OpenCV that it is a person, and mail is sent with Python's `smtplib`. Earlier versions needed `motion`, `fswebcam`, `mutt`, `msmtp` and `inotify-tools`; those are gone.
 
 Target: Raspberry Pi 4B with Raspberry Pi OS (Debian based, 64-bit recommended) and a Raspberry Pi camera on the ribbon cable (for example the HQ camera). USB webcams work too (`--usb`, see below).
 
 ```
-camera --> homesec.service --> detects movement --> saves jpg --> e-mail (SMTP) --> inbox
+camera --> homesec.service --> movement? --> person in the picture? --> saves jpg --> e-mail / Slack
 ```
 
-How detection works: the camera delivers a small grey picture (320x240, 5 per second). When the picture changes a lot between two frames, several frames in a row, that counts as movement. Slow changes such as daylight are ignored. After a mail, nothing is sent for `COOLDOWN` seconds (5 minutes by default).
+How detection works, in two steps:
+
+1. **Movement.** The camera delivers a small grey picture (320x240, 5 per second), cut into small blocks. Each block is compared with a background picture that slowly follows the scene, but only its *pattern* is compared, not its brightness. A police car's blue light on the wall, a lamp going on, clouds or the camera adjusting its exposure make the wall brighter or darker without changing its pattern, so they are ignored. A person in front of the wall changes the pattern. Touching changed blocks form a region; when the largest region covers at least `MIN_AREA` % of the picture for `FRAMES` frames in a row, that is movement. Camera noise at night is measured and ignored, and parts of the picture can be masked (`MASK`).
+2. **Person check.** Then a small AI model ([YOLOX-tiny](https://github.com/Megvii-BaseDetection/YOLOX), Apache-2.0, runs on the Pi itself) looks at the full picture, and at a close-up of the movement when it is small. Only if it sees a person (or what you set in `OBJECTS`) is an alert sent. On a Pi 4 a check takes roughly half a second, and it only runs when something moves.
+
+Each alert mail has the full-size picture and a short animated GIF: about 3 seconds before to 2 seconds after the alert, with the time on every frame and a red border from the moment of the alert (`CLIP_*` settings). The web console shows the clip when you open an event. After an alert, nothing is sent for `COOLDOWN` seconds (5 minutes by default).
 
 ## Install
 
 ```
 git clone https://github.com/spuzzelsnest/homeSec.git
 cd homeSec
-./preps.sh            # add --usb for a USB webcam
+./preps.sh            # --no-check: without the person check
 ```
 
-`preps.sh` installs `python3-picamera2` and `python3-numpy` with apt, creates a `homesec` service user (member of `video`), installs the program as `/usr/local/bin/homesec`, creates `/etc/homesec/homesec.env` and installs and enables `homesec.service`. Run it again after updating the repo; your settings are left alone. If `motion` is installed it is disabled, because it would keep the camera busy.
+`preps.sh` installs `python3-picamera2`, `python3-numpy`, `python3-pil` and `python3-opencv` with apt, downloads the person-check model (about 20 MB, checksum verified) to `/usr/local/share/homesec/models`, creates a `homesec` service user (member of `video`), installs the program as `/usr/local/bin/homesec`, creates `/etc/homesec/homesec.env` and installs and enables `homesec.service`. Run it again after updating the repo; your settings are left alone. If `motion` is installed it is disabled, because it would keep the camera busy.
 
 ## Settings
 
@@ -39,7 +44,8 @@ Connections are encrypted (`starttls` on port 587, or `ssl` on 465) and the serv
 1. Camera seen? `rpicam-hello --list-cameras` must list it. If it says "No cameras available", power off, reseat the ribbon cable (contacts towards the HDMI ports on a Pi 4B) and check `camera_auto_detect=1` in `/boot/firmware/config.txt`.
 2. Mail works? `sudo -u homesec homesec mailtest` sends a test mail, no camera needed.
 3. Camera + mail work? `sudo -u homesec homesec snapshot` takes a picture and mails it. Stop the service first (`sudo systemctl stop homesec`); only one program can use the camera.
-4. Start it: `sudo systemctl start homesec`, watch the log with `journalctl -u homesec -f` and walk in front of the camera.
+4. Person check works? `sudo -u homesec homesec check /var/lib/homesec/<picture>.jpg` on the snapshot from step 3 (with you in it) must say `person, ..% sure`.
+5. Start it: `sudo systemctl start homesec`, watch the log with `journalctl -u homesec -f` and walk in front of the camera.
 
 ## Commands
 
@@ -49,8 +55,9 @@ Connections are encrypted (`starttls` on port 587, or `ssl` on 465) and the serv
 | `homesec snapshot` | Take one picture now and mail it |
 | `homesec mailtest` | Send a test mail |
 | `homesec slacktest` | Post a test message to Slack |
+| `homesec check IMAGE` | Run the person check on a picture and show what it finds |
 
-Options: `--env FILE` uses another settings file, `-v` shows debug messages (including ignored movement, useful for tuning `THRESHOLD`). Exit code 78 means a setting is wrong; the service then stops instead of retrying.
+Options: `--env FILE` uses another settings file, `-v` shows debug messages (including ignored movement and light changes, useful for tuning). Exit code 78 means a setting is wrong; the service then stops instead of retrying.
 
 ## Slack
 
@@ -66,14 +73,18 @@ There is **no login**: anyone on your network who can reach the port sees the li
 
 ## Tuning
 
-- **False alarms** (light changes, curtains, insects at night): raise `THRESHOLD` (default 7) or `FRAMES`.
-- **Movement is missed**: lower `THRESHOLD` (try 4), or raise `FPS`.
+Every alert says what triggered it, for example `Person detected (person 87% sure, movement over 4.2% of the picture)`. The log (`journalctl -u homesec -f`) also lists movements that were *not* alerted because no person was seen. To look at those pictures, set `KEEP_REJECTED=yes`; they are kept in `/var/lib/homesec/rejected` (and deleted after `KEEP_DAYS`).
+
+- **Still false alarms with a person in them that is not there**: raise `OBJECT_CONFIDENCE` (try 0.6–0.7).
+- **People are missed**: check one of their pictures with `homesec check`. Lower `OBJECT_CONFIDENCE` (try 0.35), or `MIN_AREA` (try 0.5) when they are far away. In the dark the model sees much less: a lamp or an IR light helps.
+- **Something always moves** (a tree, a TV, a window to the street): mask it with `MASK`.
+- **Pets**: they are not people, so they are not alerted. Want them? `OBJECTS="person,cat,dog"`.
 - **Too many mails**: raise `COOLDOWN`.
-- Run `sudo -u homesec homesec run -v` in a terminal to see the score of every ignored movement.
+- `THRESHOLD` from older versions is no longer used; the log warns when it is still set.
 
 ## USB webcam
 
-Run `./preps.sh --usb` (installs `python3-opencv`) and set `CAMERA="opencv"`, optionally `VIDEO_DEVICE="/dev/video0"`, in the settings file. With `CAMERA="auto"` a USB webcam is used when no Pi camera is found. The Pi camera path is the one developed for this project; the USB path is basic.
+Run `./preps.sh` (it installs `python3-opencv`) and set `CAMERA="opencv"`, optionally `VIDEO_DEVICE="/dev/video0"`, in the settings file. With `CAMERA="auto"` a USB webcam is used when no Pi camera is found. The Pi camera path is the one developed for this project; the USB path is basic.
 
 ## Updating from the older version (motion + fswebcam + msmtp)
 
