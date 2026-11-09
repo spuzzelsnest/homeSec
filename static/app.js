@@ -8,7 +8,8 @@
     'subtitle', 'detection', 'detection-label', 'live', 'live-label', 'stage', 'stream', 'overlay',
     'overlay-text', 'stamp', 'motion-badge', 'fullscreen', 'stream-info', 'viewers', 'meter',
     'meter-fill', 'score', 'threshold', 'spark', 'events-today', 'last-motion', 'uptime', 'events',
-    'alerts', 'lightbox', 'lightbox-img', 'lightbox-caption',
+    'alerts', 'lightbox', 'lightbox-img', 'lightbox-caption', 'lightbox-download', 'lightbox-clip',
+    'lightbox-delete',
   ].map((id) => [camel(id), document.getElementById(id)]));
 
   const POLL_MS = 600;       // status refresh while the page is visible
@@ -169,13 +170,98 @@
   }
 
   // ---------- event log
+  const ICONS = {
+    download: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 4v11M7 10l5 5 5-5M5 20h14"/></svg>',
+    trash: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 7h16M10 11v6M14 11v6M6 7l1 13h10l1-13M9 7V4h6v3"/></svg>',
+  };
+  const ARM_MS = 4000;       // a delete button stays "armed" (click again to confirm) this long
+  let viewing = null;        // the event open in the viewer
+
+  const download = (url) => `${url}?download=1`;
+
+  // Deleting needs two clicks: the first arms the button ("Delete?"), the second deletes.
+  function armable(button, armedText, action) {
+    let timer = null;
+    const label = button.innerHTML;
+    const disarm = () => {
+      clearTimeout(timer);
+      timer = null;
+      button.classList.remove('armed');
+      button.innerHTML = label;
+    };
+    button.addEventListener('click', async (e) => {
+      e.stopPropagation();
+      if (!timer) {
+        button.classList.add('armed');
+        button.textContent = armedText;
+        timer = setTimeout(disarm, ARM_MS);
+        return;
+      }
+      disarm();
+      button.disabled = true;
+      try {
+        await action();
+      } catch (err) {
+        button.textContent = 'Failed';
+        setTimeout(() => { button.innerHTML = label; }, 2000);
+      } finally {
+        button.disabled = false;
+      }
+    });
+    return disarm;
+  }
+
+  async function deleteEvent(event) {
+    const response = await fetch('/api/events/delete', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: `name=${encodeURIComponent(event.name)}`,
+    });
+    if (!response.ok && response.status !== 404) throw new Error(String(response.status));
+    if (viewing && viewing.name === event.name) el.lightbox.close();
+    eventsKey = null;        // counts in the status change too
+    renderEvents(response.ok ? (await response.json()).events : (await getJSON('/api/events')).events);
+  }
+
+  const disarmViewer = armable(el.lightboxDelete, 'Delete? Click again', () => deleteEvent(viewing));
+
   function openPicture(event) {
+    viewing = event;
     el.lightboxImg.src = event.clip || event.url;  // the clip (seconds before and after) when there is one
     el.lightboxCaption.textContent = `${event.date}  ${event.time}${event.clip ? '  · clip' : ''}`;
+    el.lightboxDownload.href = download(event.url);
+    el.lightboxClip.hidden = !event.clip;
+    if (event.clip) el.lightboxClip.href = download(event.clip);
+    disarmViewer();
     el.lightbox.showModal();
   }
   el.lightbox.addEventListener('click', (e) => { if (e.target === el.lightbox) el.lightbox.close(); });
-  el.lightbox.addEventListener('close', () => el.lightboxImg.removeAttribute('src'));
+  el.lightbox.addEventListener('close', () => {
+    el.lightboxImg.removeAttribute('src');
+    viewing = null;
+  });
+
+  function eventActions(event) {
+    const box = document.createElement('div');
+    box.className = 'event-actions';
+    const get = document.createElement('a');
+    get.className = 'icon-btn small';
+    get.href = download(event.url);
+    get.setAttribute('download', '');
+    get.title = 'Download the picture';
+    get.setAttribute('aria-label', `Download the picture from ${event.date} ${event.time}`);
+    get.innerHTML = ICONS.download;
+    get.addEventListener('click', (e) => e.stopPropagation());
+    const del = document.createElement('button');
+    del.type = 'button';
+    del.className = 'icon-btn small danger';
+    del.title = 'Delete (click twice)';
+    del.setAttribute('aria-label', `Delete the picture from ${event.date} ${event.time}`);
+    del.innerHTML = ICONS.trash;
+    armable(del, 'Delete?', () => deleteEvent(event));
+    box.append(get, del);
+    return box;
+  }
 
   function renderEvents(events) {
     el.events.replaceChildren();
@@ -189,6 +275,7 @@
     const today = dateText(serverNow());
     for (const event of events) {
       const li = document.createElement('li');
+      li.className = 'event-row';
       const button = document.createElement('button');
       button.type = 'button';
       button.className = 'event';
@@ -205,7 +292,7 @@
       text.append(time, day);
       button.append(img, text);
       button.addEventListener('click', () => openPicture(event));
-      li.append(button);
+      li.append(button, eventActions(event));
       el.events.append(li);
     }
   }

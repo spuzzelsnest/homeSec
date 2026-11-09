@@ -1340,6 +1340,18 @@ class App:
             "slack": {"enabled": bool(cfg.slack_webhook), "channel": cfg.slack_channel},
         }
 
+    def delete_event(self, name: str) -> bool:
+        """Delete a saved picture and its clip. False when there is no such picture."""
+        if not EVENT_NAME.match(name):
+            return False
+        path = self.cfg.image_dir / name
+        if not path.is_file():
+            return False
+        path.unlink()
+        path.with_suffix(".gif").unlink(missing_ok=True)
+        self._names_at = float("-inf")  # rescan the folder on the next request
+        return True
+
     def events(self, limit: int = 30) -> list:
         events = []
         for name in self.names()[:limit]:
@@ -1384,9 +1396,11 @@ def make_handler(app: App):
         timeout = 30  # seconds: a stalled or half-open connection must not hold a thread for ever
 
         def _send(self, code: int, body: bytes = b"", ctype: str = "text/plain; charset=utf-8",
-                  cache: str = "no-store") -> None:
+                  cache: str = "no-store", extra: Optional[dict] = None) -> None:
             self.send_response(code)
             self.send_header("Content-Type", ctype)
+            for key, value in (extra or {}).items():
+                self.send_header(key, value)
             self.send_header("Content-Length", str(len(body)))
             self.send_header("Cache-Control", cache)
             for key, value in security.items():
@@ -1406,7 +1420,8 @@ def make_handler(app: App):
         def do_GET(self):
             if not self._host_ok():
                 return
-            path = urlparse(self.path).path
+            url = urlparse(self.path)
+            path = url.path
             if path == "/api/status":
                 return self._json(app.status())
             if path == "/api/events":
@@ -1414,7 +1429,7 @@ def make_handler(app: App):
             if path == "/stream.mjpg":
                 return self._stream()
             if path.startswith("/pictures/"):
-                return self._picture(path[len("/pictures/"):])
+                return self._picture(path[len("/pictures/"):], "download" in parse_qs(url.query))
             self._static("index.html" if path in ("/", "/index.html") else path.lstrip("/"))
 
         def _static(self, name: str) -> None:
@@ -1431,7 +1446,7 @@ def make_handler(app: App):
                 ctype += "; charset=utf-8"
             self._send(200, data, ctype, "no-cache")
 
-        def _picture(self, name: str) -> None:
+        def _picture(self, name: str, download: bool = False) -> None:
             if not MEDIA_NAME.match(name):  # no slashes, one dot: nothing outside the picture folder
                 return self._send(404, b"not found")
             try:
@@ -1439,7 +1454,8 @@ def make_handler(app: App):
             except OSError:
                 return self._send(404, b"not found")
             ctype = "image/gif" if name.endswith(".gif") else "image/jpeg"
-            self._send(200, data, ctype, "private, max-age=3600")
+            extra = {"Content-Disposition": f'attachment; filename="homesec_{name}"'} if download else None
+            self._send(200, data, ctype, "private, max-age=3600", extra)
 
         def _client_gone(self) -> bool:
             """True when the viewer closed the connection. Needed because with no new pictures there is
@@ -1487,11 +1503,25 @@ def make_handler(app: App):
                 length = int(self.headers.get("Content-Length", "0"))
             except ValueError:
                 length = -1
-            if urlparse(self.path).path != "/api/detection":
+            path = urlparse(self.path).path
+            if path not in ("/api/detection", "/api/events/delete"):
                 return self._send(404, b"not found")
             if not 0 <= length <= 100:
                 return self._send(400, b"bad request")
-            state = parse_qs(self.rfile.read(length).decode("ascii", "replace")).get("state", [""])[0]
+            form = parse_qs(self.rfile.read(length).decode("ascii", "replace"))
+            if path == "/api/events/delete":
+                name = form.get("name", [""])[0]
+                if not EVENT_NAME.match(name):
+                    return self._send(400, b"bad request")
+                try:
+                    if not app.delete_event(name):
+                        return self._send(404, b"not found")
+                except OSError as exc:
+                    log.error("could not delete %s: %s", name, exc)
+                    return self._send(500, b"could not delete the picture")
+                log.info("picture %s deleted from the web page (%s)", name, self.client_address[0])
+                return self._json({"deleted": name, "events": app.events()})
+            state = form.get("state", [""])[0]
             if state not in ("on", "off"):
                 return self._send(400, b"bad request")
             app.control.set_paused(state == "off")

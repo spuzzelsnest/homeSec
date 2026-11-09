@@ -86,7 +86,14 @@
   <dialog id="lightbox" aria-label="Captured picture">
     <form method="dialog">
       <img id="lightbox-img" alt="Captured picture">
-      <p id="lightbox-caption" class="muted"></p>
+      <div class="viewer-bar">
+        <p id="lightbox-caption" class="muted"></p>
+        <div class="viewer-actions">
+          <a id="lightbox-download" class="tool" href="#" download>Picture</a>
+          <a id="lightbox-clip" class="tool" href="#" download hidden>Clip</a>
+          <button id="lightbox-delete" class="tool danger" type="button">Delete</button>
+        </div>
+      </div>
       <button class="icon-btn close" aria-label="Close">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M6 6l12 12M18 6 6 18"/></svg>
       </button>

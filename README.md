@@ -67,7 +67,7 @@ Set `SLACK_WEBHOOK_URL` (an [incoming webhook](https://api.slack.com/messaging/w
 
 ## Web console
 
-While the service runs, open `http://<name-or-ip-of-the-Pi>:8080/` (for example `http://pycam.local:8080/`). It has the live camera view (MJPEG, up to 4 viewers), a motion meter with graph, today's activity, the event log with pictures, and one button that pauses or resumes detection. While paused the camera is not watched and no alerts are sent. The choice survives a restart. The files are in `static/` (`index.html`, `style.css`, `app.js`); `deploy.sh` copies them to `/usr/local/share/homesec/static`.
+While the service runs, open `http://<name-or-ip-of-the-Pi>:8080/` (for example `http://pycam.local:8080/`). It has the live camera view (MJPEG, up to 4 viewers), a motion meter with graph, today's activity, the event log with pictures, and one button that pauses or resumes detection. Every event has a download and a delete button (delete needs a second click to confirm, and removes the picture and its clip); the picture viewer has the same buttons plus a download for the clip. While paused the camera is not watched and no alerts are sent. The choice survives a restart. The files are in `static/` (`index.html`, `style.css`, `app.js`); `deploy.sh` copies them to `/usr/local/share/homesec/static`.
 
 Watching the live view makes detection slower while a page is open, more so at a high `RESOLUTION`; `1280x720` and `FPS=10` is a good choice.
 
