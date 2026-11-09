@@ -3,9 +3,13 @@
 # Install homeSec on Raspberry Pi OS (Debian). Run as your normal user; sudo is asked for.
 # Safe to run again: it installs the latest program and service file, and keeps your settings.
 #
-# Usage: ./preps.sh [--no-check]
+# Usage: ./preps.sh [--no-check] [--no-test]
 #   --no-check   skip the person check: no OpenCV, no model download (every movement is alerted)
+#   --no-test    do not test and start the service at the end
 #   --usb        accepted for older instructions; OpenCV (needed for a USB webcam) is installed anyway
+#
+# At the end it tests everything itself (camera + mail, person check, Slack if set up) and
+# starts the service. That sends one test mail with a camera picture per run.
 
 set -euo pipefail
 
@@ -20,11 +24,15 @@ model_sha256=427cc366d34e27ff7a03e2899b5e3671425c262ea2291f88bb942bc1cc70b0f7
 model_file=$model_dir/yolox_tiny.onnx
 
 use_check=1
-case "${1:-}" in
-    ""|--usb)   ;;
-    --no-check) use_check=0 ;;
-    *)          echo "Usage: $0 [--no-check]" >&2; exit 2 ;;
-esac
+use_test=1
+for arg in "$@"; do
+    case "$arg" in
+        --usb)      ;;
+        --no-check) use_check=0 ;;
+        --no-test)  use_test=0 ;;
+        *)          echo "Usage: $0 [--no-check] [--no-test]" >&2; exit 2 ;;
+    esac
+done
 
 if [[ $EUID -eq 0 ]]; then
     echo "Please run this as your normal user, not as root." >&2
@@ -112,17 +120,113 @@ sudo install -m 0644 "$SCRIPT_DIR/homesec.service" /etc/systemd/system/homesec.s
 sudo systemctl daemon-reload
 sudo systemctl enable homesec.service
 
-cat <<EOF
-
-Done. The service is enabled but NOT started yet. Next steps (see README.md):
-  1. sudoedit $env_file            # MAIL_TO and the SMTP_* mail settings
-  2. sudo -u $service_user homesec mailtest     # does a test mail arrive?
-  3. sudo -u $service_user homesec snapshot     # does a picture from the camera arrive?
-  4. sudo -u $service_user homesec slacktest    # optional: Slack set up?
-  5. sudo -u $service_user homesec check /var/lib/homesec/<a picture>.jpg   # person check works?
-  6. sudo systemctl start homesec               # and: journalctl -u homesec -f
+old_software_note() {
+    cat <<EOF
 
 Software from older versions is no longer needed. If nothing else on this Pi uses it, remove it:
   sudo apt purge motion fswebcam mutt msmtp-mta inotify-tools && sudo apt autoremove
   sudo rm -f /etc/msmtprc /etc/msmtp-password    # old mail settings, may contain your password
 EOF
+}
+
+if (( ! use_test )); then
+    echo
+    echo "Done. Not tested (--no-test); start with: sudo systemctl start homesec"
+    old_software_note
+    exit 0
+fi
+
+# ---- settings filled in? ---------------------------------------------------------------
+# the example's placeholders: you@example.com, you@gmail.com, 'your app password'
+placeholders() { sudo grep -qE 'you@example\.com|you@gmail\.com|your app password' "$env_file"; }
+
+if placeholders || ! sudo grep -qE '^SMTP_HOST=.+' "$env_file"; then
+    echo
+    echo "The mail settings in $env_file are not filled in yet (only needed once; later runs keep them)."
+    if [[ -t 0 ]]; then
+        read -r -p "Open the settings file now? [Y/n] " answer
+        if [[ ${answer:-y} =~ ^[Yy] ]]; then
+            sudoedit "$env_file"
+        fi
+    fi
+    if placeholders || ! sudo grep -qE '^SMTP_HOST=.+' "$env_file"; then
+        echo "Still not filled in. Edit it (sudoedit $env_file) and run ./preps.sh again."
+        old_software_note
+        exit 1
+    fi
+fi
+
+# ---- tests -------------------------------------------------------------------------------
+echo
+echo "== Testing =="
+as_homesec() { sudo -u "$service_user" -- "$@"; }
+results=()
+failed=0
+report() {  # report <test> <ok|FAIL|skipped> [detail]
+    results+=("$(printf '  %-14s %-8s %s' "$1" "$2" "${3:-}")")
+    [[ $2 == FAIL ]] && failed=1
+    return 0
+}
+
+echo "-- camera + mail (takes a picture and mails it)"
+if out=$(as_homesec homesec snapshot 2>&1); then
+    picture=$(grep -oE '/var/lib/homesec/[0-9_-]+\.jpg' <<<"$out" | tail -1 || true)
+    report "camera + mail" ok "picture mailed to $(sudo grep -E '^MAIL_TO=' "$env_file" | cut -d= -f2- | tr -d \"\')"
+else
+    picture=$(grep -oE '/var/lib/homesec/[0-9_-]+\.jpg' <<<"$out" | tail -1 || true)
+    if [[ -n $picture ]]; then
+        report "camera" ok "picture taken"
+        report "mail" FAIL "$(grep -E 'ERROR' <<<"$out" | tail -1 | sed 's/.*ERROR //')"
+    else
+        report "camera" FAIL "$(grep -E 'ERROR' <<<"$out" | tail -1 | sed 's/.*ERROR //')"
+    fi
+fi
+
+if (( use_check )); then
+    echo "-- person check"
+    if [[ -z ${picture:-} ]]; then
+        report "person check" skipped "no camera picture"
+    elif out=$(as_homesec homesec check "$picture" 2>&1); then
+        report "person check" ok "$out"
+    elif grep -q '^no ' <<<"$out"; then
+        report "person check" ok "works; $out"   # nobody in view is fine
+    else
+        report "person check" FAIL "$(tail -1 <<<"$out" | sed 's/.*ERROR //')"
+    fi
+fi
+
+if sudo grep -qE '^SLACK_WEBHOOK_URL=.+' "$env_file"; then
+    echo "-- Slack"
+    if out=$(as_homesec homesec slacktest 2>&1); then
+        report "Slack" ok "test message posted"
+    else
+        report "Slack" FAIL "$(grep -E 'ERROR' <<<"$out" | tail -1 | sed 's/.*ERROR //')"
+    fi
+else
+    report "Slack" skipped "SLACK_WEBHOOK_URL not set"
+fi
+
+# ---- start ---------------------------------------------------------------------------------
+echo "-- starting the service"
+sudo systemctl restart homesec.service
+sleep 8
+if systemctl is-active --quiet homesec.service; then
+    report "service" ok "running"
+else
+    report "service" FAIL "not running, see: journalctl -u homesec -e"
+fi
+
+echo
+echo "== Result =="
+printf '%s\n' "${results[@]}"
+echo
+echo "Last log lines:"
+sudo journalctl -u homesec.service -n 6 --no-pager -o cat | sed 's/^/  /'
+echo
+if (( failed )); then
+    echo "Something failed (see above). Fix it and run ./preps.sh again."
+else
+    echo "All good. Watch it live with: journalctl -u homesec -f   (web console: http://$(hostname).local:8080/)"
+fi
+old_software_note
+exit "$failed"

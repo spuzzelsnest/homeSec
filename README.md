@@ -25,7 +25,9 @@ cd homeSec
 ./preps.sh            # --no-check: without the person check
 ```
 
-`preps.sh` installs `python3-picamera2`, `python3-numpy`, `python3-pil` and `python3-opencv` with apt, downloads the person-check model (about 20 MB, checksum verified) to `/usr/local/share/homesec/models`, creates a `homesec` service user (member of `video`), installs the program as `/usr/local/bin/homesec`, creates `/etc/homesec/homesec.env` and installs and enables `homesec.service`. Run it again after updating the repo; your settings are left alone. If `motion` is installed it is disabled, because it would keep the camera busy.
+`preps.sh` installs `python3-picamera2`, `python3-numpy`, `python3-pil` and `python3-opencv` with apt, downloads the person-check model (about 20 MB, checksum verified) to `/usr/local/share/homesec/models`, creates a `homesec` service user (member of `video`), installs the program as `/usr/local/bin/homesec`, creates `/etc/homesec/homesec.env` and installs and enables `homesec.service`. Run it again after updating the repo; your settings are left alone.
+
+At the end `preps.sh` tests everything itself and starts the service: it takes a camera picture and mails it, runs the person check on it, posts a Slack test message (if set up), restarts `homesec` and prints a short result table plus the last log lines. That is one test mail per run. On the first run it offers to open the settings file, because the mail settings must be filled in once. `./preps.sh --no-test` skips the tests and does not start the service. The steps below are the same tests by hand, for troubleshooting. If `motion` is installed it is disabled, because it would keep the camera busy.
 
 ## Settings
 
