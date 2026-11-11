@@ -251,6 +251,7 @@ class Config:
     video_fps: float
     video_kbps: int
     visit_keep_days: int
+    alert_video: bool
     warmup: float
     cooldown: float
     keep_days: int
@@ -362,8 +363,9 @@ class Config:
             video_after=r.number("VIDEO_AFTER", 7.0, float, 1, 120),
             video_max=r.number("VIDEO_MAX", 60.0, float, 5, 600),
             video_fps=r.number("VIDEO_FPS", 15.0, float, 1, 30),
-            video_kbps=r.number("VIDEO_KBPS", 4000, int, 500, 25000),
+            video_kbps=r.number("VIDEO_KBPS", 8000, int, 500, 25000),
             visit_keep_days=r.number("VISIT_KEEP_DAYS", 30, int, 1, 3650),
+            alert_video=r.flag("ALERT_VIDEO", True),
             warmup=r.number("WARMUP", 5.0, float, 0, 600),
             cooldown=r.number("COOLDOWN", 300.0, float, 1, 86400),
             keep_days=r.number("KEEP_DAYS", 7, int, 1, 3650),
@@ -388,6 +390,7 @@ class Config:
 
 def build_message(cfg: Config, image: Optional[Path] = None, subject: Optional[str] = None,
                   body: Optional[str] = None, extra: tuple = ()) -> EmailMessage:
+    kinds = {".gif": ("image", "gif"), ".mp4": ("video", "mp4")}
     msg = EmailMessage()
     msg["Subject"] = subject or cfg.mail_subject or "Motion detected"
     msg["From"] = cfg.mail_from
@@ -396,8 +399,8 @@ def build_message(cfg: Config, image: Optional[Path] = None, subject: Optional[s
     msg["Message-ID"] = make_msgid(domain=socket.gethostname())
     msg.set_content(body or f"Motion detected on {socket.gethostname()} at {datetime.now():%Y-%m-%d %H:%M:%S}.")
     for attachment in ((image,) if image is not None else ()) + tuple(extra):
-        subtype = "gif" if attachment.suffix.lower() == ".gif" else "jpeg"
-        msg.add_attachment(attachment.read_bytes(), maintype="image", subtype=subtype, filename=attachment.name)
+        maintype, subtype = kinds.get(attachment.suffix.lower(), ("image", "jpeg"))
+        msg.add_attachment(attachment.read_bytes(), maintype=maintype, subtype=subtype, filename=attachment.name)
     return msg
 
 
@@ -480,6 +483,7 @@ class Event:
     clip: tuple = field(default=(), repr=False, compare=False)  # ((clock time, small RGB frame), ...)
     clip_t: float = 0.0        # clock time of the alert, to mark it in the clip
     clip_fps: float = 2.0
+    video: Optional[Path] = None   # the alert video (MP4) being recorded, linked from the mail
 
     def headline(self) -> str:
         return f"{self.label.capitalize()} detected" if self.label else "Motion detected"
@@ -491,13 +495,23 @@ class Event:
         return ", ".join(parts)
 
 
-def event_body(event: Event, clip: Optional[Path] = None) -> str:
+def console_link(cfg: Config, path: str = "/") -> str:
+    host = socket.gethostname()
+    return (cfg.web_url or f"http://{host}.local:{cfg.web_port}") + path
+
+
+def event_body(event: Event, clip: Optional[Path] = None, cfg: Optional[Config] = None) -> str:
     text = (f"{event.headline()} on {socket.gethostname()} at {event.when:%Y-%m-%d %H:%M:%S}\n"
             f"({event.details()}).")
     if clip is not None and event.clip:
         first, last = event.clip[0][0] - event.clip_t, event.clip[-1][0] - event.clip_t
         text += (f"\n\nThe animation ({clip.name}) runs from {-first:.0f} s before to {last:.0f} s after the alert; "
                  "frames from the alert on have a red border.")
+    if event.video is not None:
+        where = (console_link(cfg, f"/pictures/{event.video.name}") if cfg is not None and cfg.web_port
+                 else str(event.video))
+        text += ("\n\nThe full video, from a few seconds before the alert until the movement stops, is being "
+                 f"recorded: {where} (ready when the movement has stopped).")
     return text
 
 
@@ -550,7 +564,7 @@ class Mailer(_RetryWorker):
                     log.warning("could not make the clip %s: %s", clip.name, exc)
                     clip = None
         msg = build_message(self._cfg, event.path, subject=self._cfg.mail_subject or event.headline(),
-                            body=event_body(event, clip), extra=(clip,) if clip else ())
+                            body=event_body(event, clip, self._cfg), extra=(clip,) if clip else ())
         self._send(self._cfg, msg)
         log.info("mailed %s to %s", event.path.name, ", ".join(self._cfg.mail_to))
 
@@ -597,14 +611,16 @@ def post_slack(cfg: Config, text: str) -> None:
         _slack_post(cfg.slack_webhook, {"text": text})
 
 
-def slack_text(cfg: Config, event: Event) -> str:
+def slack_text(cfg: Config, event: Event, video: bool = False) -> str:
     host = socket.gethostname()
     text = (f":rotating_light: *{event.headline()}* on `{host}` at {event.when:%Y-%m-%d %H:%M:%S} "
             f"({event.details()})")
     if cfg.web_port:
         base = cfg.web_url or f"http://{host}.local:{cfg.web_port}"
         links = [f"<{base}/pictures/{event.path.name}|View picture>"]
-        if cfg.clip_width:
+        if video:  # ready when the movement has stopped
+            links.append(f"<{base}/pictures/{event.path.stem}.mp4|View video>")
+        elif cfg.clip_width:
             links.append(f"<{base}/pictures/{event.path.stem}.gif|View clip>")
         text += "\n" + "  ·  ".join(links + [f"<{base}/|Open console>"])
     return text
@@ -686,13 +702,15 @@ class VideoBuffer:
         output.error_callback = lambda exc: log.error("writing %s failed: %s", path.name, exc)
         self._current = (part, path)
 
-    def close(self) -> Optional[Path]:
+    def close(self, target: Optional[Path] = None) -> Optional[Path]:
+        """Finish the recording; it is saved as `target`, or the name given to open()."""
         if self._current is None:
             return None
         part, path = self._current
         self._current = None
         self._circular.close_output()
         if part.is_file() and part.stat().st_size > 0:
+            path = target or path
             part.replace(path)
             return path
         part.unlink(missing_ok=True)
@@ -729,7 +747,7 @@ class PiCamera:
         self.color_width = 0  # when set, read_gray also keeps a small colour copy in .color
         self.color: Optional[np.ndarray] = None
         self.video: Optional[VideoBuffer] = None
-        video = bool(cfg.record_objects) and cfg.object_check != "off"
+        video = cfg.alert_video or (bool(cfg.record_objects) and cfg.object_check != "off")
         try:
             model = str(self._cam.camera_properties.get("Model", "")).upper()  # e.g. IMX477
         except Exception:  # not every camera reports a model
@@ -757,7 +775,7 @@ class PiCamera:
             try:
                 self.video = VideoBuffer(self._cam, cfg.video_before, cfg.video_kbps, cfg.video_fps)
             except ImportError as exc:
-                log.warning("no visit videos: %s (sudo apt install python3-av, or run ./deploy.sh)", exc)
+                log.warning("no videos: %s (sudo apt install python3-av, or run ./deploy.sh)", exc)
 
     def _release(self) -> None:
         try:
@@ -770,7 +788,7 @@ class PiCamera:
             try:
                 self.video.start()
             except Exception as exc:  # the alarm matters more than the videos
-                log.warning("no visit videos: the video encoder did not start (%s)", exc)
+                log.warning("no videos: the video encoder did not start (%s)", exc)
                 self.video = None
         try:
             self._cam.start()
@@ -890,6 +908,8 @@ class MotionResult:
     changed: float               # all changed blocks together, percent
     box: Optional[tuple] = None  # (left, top, right, bottom) of the largest region, fractions 0..1
     reason: str = ""             # why nothing counts: "learning", "light change"
+    active: float = 0.0          # part of the picture that changed since the previous frame, percent:
+                                 # something is moving right now (someone standing still is not)
 
 
 class MotionDetector:
@@ -925,9 +945,11 @@ class MotionDetector:
         self._grid = (0, 0)
         self._watched: Optional[np.ndarray] = None
         self._basis: tuple = ()
+        self._prev: Optional[np.ndarray] = None  # pattern of the previous frame
 
     def reset(self) -> None:
         self._bg = None
+        self._prev = None
         self._hits = 0
 
     def _prepare(self, gray: np.ndarray) -> np.ndarray:
@@ -984,6 +1006,14 @@ class MotionDetector:
         visible = var_c >= floor
         match = cov / np.sqrt(var_c * np.maximum(var_r, floor) + 1e-6)
         changed = visible & (match < self.MATCH) & self._watched
+        active = 0.0
+        if self._prev is not None:  # the same comparison with the previous frame instead of the background
+            var_p = np.einsum("ijk,ijk->ij", self._prev, self._prev) / n
+            cov_p = np.einsum("ijk,ijk->ij", cur, self._prev) / n
+            match_p = cov_p / np.sqrt(var_c * np.maximum(var_p, floor) + 1e-6)
+            now = ((var_c >= floor) | (var_p >= floor)) & (match_p < self.MATCH) & self._watched
+            active = 100.0 * int(now.sum()) / max(1, int(self._watched.sum()))
+        self._prev = cur
 
         rate = np.where(changed, self.ADAPT_CHANGED, self.ADAPT).astype(np.float32)
         b = self.BLOCK
@@ -994,7 +1024,7 @@ class MotionDetector:
         if changed_pct > self.max_area:
             self._bg = img.copy()
             self._hits = 0
-            return MotionResult(False, 0.0, changed_pct, reason="light change")
+            return MotionResult(False, 0.0, changed_pct, reason="light change", active=active)
         size, box = largest_region(changed)
         area = 100.0 * size / total
         self._hits = self._hits + 1 if area >= self.min_area else 0
@@ -1003,7 +1033,7 @@ class MotionDetector:
             self._hits = 0
         rows, cols = self._grid
         frac = None if box is None else (box[1] / cols, box[0] / rows, (box[3] + 1) / cols, (box[2] + 1) / rows)
-        return MotionResult(moving, area, changed_pct, frac)
+        return MotionResult(moving, area, changed_pct, frac, active=active)
 
 
 def noise_level(img: np.ndarray) -> float:
@@ -1219,7 +1249,8 @@ def prune(image_dir: Path, keep_days: int) -> int:
     """Delete pictures older than keep_days so the SD card does not fill up."""
     cutoff = time.time() - keep_days * 86400
     removed = 0
-    for path in [*image_dir.glob("*.jpg"), *image_dir.glob("*.gif"), *image_dir.glob("rejected/*.jpg")]:
+    for path in [*image_dir.glob("*.jpg"), *image_dir.glob("*.gif"), *image_dir.glob("*.mp4"),
+                 *image_dir.glob("*.mp4.part"), *image_dir.glob("rejected/*.jpg")]:
         try:
             if path.stat().st_mtime < cutoff:
                 path.unlink()
@@ -1271,18 +1302,20 @@ class ClipRecorder:
 
 
 @dataclass
-class Visit:
-    """A visit being recorded."""
+class Recording:
+    """A video being recorded: an alert (until the movement stops) or a visit (while the visitor is seen)."""
 
-    base: Path          # visits/2026-11-10_073012 (.mp4, .jpg, .json)
+    kind: str           # "alert" or "visit"
+    base: Path          # where it ends up, without suffix: 2026-11-10_073012 (.mp4, .jpg, .json)
     label: str
     confidence: float
     start: float        # clock times
     until: float
+    event: Optional[Event] = None
 
 
 class Watcher:
-    """One detection step per camera frame; alerts with a picture when something moves."""
+    """One detection step per camera frame; alerts with a picture and a video when something moves."""
 
     def __init__(self, cfg: Config, camera, mailer: Mailer,
                  clock: Callable = time.monotonic, now: Callable = datetime.now,
@@ -1295,12 +1328,14 @@ class Watcher:
         self.slack = slack
         self.check = check
         self.last_score = 0.0  # moving part of the picture in percent, for the meter on the web page
-        self.video = getattr(camera, "video", None)  # VideoBuffer, or None: no visit videos
+        self.video = getattr(camera, "video", None)  # VideoBuffer, or None: no videos
         self.visits = self.video is not None and check is not None and bool(cfg.record_objects)
-        self.visit: Optional[Visit] = None
+        self.alert_videos = self.video is not None and cfg.alert_video
+        self.rec: Optional[Recording] = None
         # birds are small: with visits on, smaller movements are looked at too (the check decides)
         min_area = min(cfg.min_area, cfg.record_min_area) if self.visits else cfg.min_area
         self.detector = MotionDetector(min_area, cfg.max_area, cfg.frames, cfg.mask)
+        # the animated GIF around the alert, for the mail (CLIP_*)
         self.recorder = ClipRecorder(cfg.clip_before, cfg.clip_after, cfg.clip_fps) if cfg.clip_width else None
         self._clock = clock
         self._now = now
@@ -1308,6 +1343,11 @@ class Watcher:
         self._last_trigger: Optional[float] = None
         self._last_check: Optional[float] = None
         self._was_paused = False
+
+    @property
+    def visit(self) -> Optional[Recording]:
+        """The visit being recorded, if any (for the web page)."""
+        return self.rec if self.rec is not None and self.rec.kind == "visit" else None
 
     def step(self) -> Optional[Path]:
         if self.control is not None and self.control.paused:
@@ -1322,8 +1362,9 @@ class Watcher:
             self._was_paused = False
             self.detector.reset()  # the background is stale
         t = self._clock()
-        if self.visit is not None and t >= self.visit.until + self.cfg.video_before:
-            self._end_visit(t)
+        # the video lags VIDEO_BEFORE seconds behind (it starts that early), so it is closed that much later
+        if self.rec is not None and t >= self.rec.until + self.cfg.video_before:
+            self._finish(t)
         grab = self.recorder is not None and self.recorder.due(t)
         if grab:
             self.camera.color_width = self.cfg.clip_width
@@ -1339,11 +1380,16 @@ class Watcher:
         self.last_score = result.area
         if result.reason == "light change":
             log.debug("light change over %.0f%% of the picture ignored", result.changed)
+        alert_running = self.rec is not None and self.rec.kind == "alert"
+        if alert_running and result.active >= self.detector.min_area:
+            self._extend(t)  # an alert video runs until the movement has stopped
         if not result.moving:
             return None
         if t - self._started < self.cfg.warmup:
             log.debug("movement (%.1f%%) ignored during warm-up", result.area)
             return None
+        if alert_running:
+            return None  # being filmed already; nothing more to decide
         cooldown = self._last_trigger is not None and t - self._last_trigger < self.cfg.cooldown
         if cooldown and not self.visits:
             log.debug("movement (%.1f%%) ignored, cooldown active", result.area)
@@ -1377,31 +1423,55 @@ class Watcher:
             path.unlink(missing_ok=True)
             return None
         event = Event(path, result.area, found.label if found else "", found.confidence if found else 0.0, stamp)
-        self._last_trigger = t
-        log.info("%s (%s), saved %s", event.headline().lower(), event.details(), path.name)
-        if self.recorder is not None:  # the mail goes out when the clip is complete, `CLIP_AFTER` seconds on
-            self.recorder.start(t, lambda frames, e=event: self.mailer.submit(
-                replace(e, clip=frames, clip_t=t, clip_fps=self.cfg.clip_fps)))
-        else:
-            self.mailer.submit(event)
-        if self.slack is not None:
-            self.slack.submit(slack_text(self.cfg, event))
-        prune(self.cfg.image_dir, self.cfg.keep_days)
+        self._alert(t, event)
         return path
 
-    def flush(self) -> None:
-        """Send alerts whose clip is still being recorded now and end a visit video (pause, shutdown)."""
-        if self.recorder is not None:
-            self.recorder.flush()
-        if self.visit is not None:
-            self._end_visit(self._clock())
+    # ---- alerts
+    def _alert(self, t: float, event: Event) -> None:
+        cfg = self.cfg
+        self._last_trigger = t
+        log.info("%s (%s), saved %s", event.headline().lower(), event.details(), event.path.name)
+        filming = self.alert_videos and self._film_alert(t, event)
+        if filming:  # the mail links to it; the video itself is watched in the console
+            event = replace(event, video=event.path.with_suffix(".mp4"))
+        if self.recorder is not None:  # the mail goes out when the GIF is complete, CLIP_AFTER seconds on
+            self.recorder.start(t, lambda frames, e=event: self.mailer.submit(
+                replace(e, clip=frames, clip_t=t, clip_fps=cfg.clip_fps)))
+        else:
+            self.mailer.submit(event)
+        if self.slack is not None:  # Slack straight away
+            self.slack.submit(slack_text(cfg, event, video=filming))
+        prune(cfg.image_dir, cfg.keep_days)
+
+    def _film_alert(self, t: float, event: Event) -> bool:
+        cfg = self.cfg
+        base = event.path.with_suffix("")
+        rec = self.rec
+        if rec is not None:  # a visit was being filmed: it becomes the alert video
+            rec.base.with_suffix(".jpg").unlink(missing_ok=True)
+            rec.kind, rec.base, rec.event = "alert", base, event
+            rec.label, rec.confidence = event.label, event.confidence
+            self._extend(t)
+            log.info("the %s video continues as the alert video %s.mp4", "visit", base.name)
+            return True
+        try:
+            self.video.open(base.with_suffix(".mp4"))
+        except Exception as exc:
+            log.error("could not start the alert video (%s); mailing the picture now", exc)
+            return False
+        self.rec = Recording("alert", base, event.label, event.confidence, t, t + cfg.video_after, event)
+        return True
+
+    def _extend(self, t: float) -> None:
+        rec = self.rec
+        rec.until = min(rec.start + self.cfg.video_max, max(rec.until, t + self.cfg.video_after))
 
     # ---- visits (RECORD_OBJECTS): a video, no alert
     def _seen_visitor(self, t: float, path: Path, found: Found) -> None:
         cfg = self.cfg
-        if self.visit is not None:  # still there: keep recording, up to VIDEO_MAX
-            self.visit.until = min(self.visit.start + cfg.video_max, t + cfg.video_after)
-            self.visit.confidence = max(self.visit.confidence, found.confidence)
+        if self.rec is not None:  # still there: keep recording, up to VIDEO_MAX
+            self._extend(t)
+            self.rec.confidence = max(self.rec.confidence, found.confidence)
             path.unlink(missing_ok=True)
             return
         visit_dir = cfg.image_dir / "visits"
@@ -1414,29 +1484,42 @@ class Watcher:
             log.error("could not start the visit video: %s", exc)
             path.unlink(missing_ok=True)
             return
-        self.visit = Visit(base, found.label, found.confidence, t, t + cfg.video_after)
+        self.rec = Recording("visit", base, found.label, found.confidence, t, t + cfg.video_after)
         log.info("%s visiting (%.0f%% sure): recording %s.mp4", found.label, found.confidence * 100, base.name)
         prune_visits(visit_dir, cfg.visit_keep_days)
 
-    def _end_visit(self, t: float) -> None:
-        visit, self.visit = self.visit, None
+    def _finish(self, t: float) -> None:
+        rec, self.rec = self.rec, None
+        # the video covers start - VIDEO_BEFORE .. until (or less, when closed early)
+        seconds = round(min(t - self.cfg.video_before, rec.until) - rec.start + self.cfg.video_before)
         try:
-            video = self.video.close()
+            video = self.video.close(rec.base.with_suffix(".mp4"))
         except Exception as exc:
-            log.error("could not finish the visit video %s.mp4: %s", visit.base.name, exc)
+            log.error("could not finish the video %s.mp4: %s", rec.base.name, exc)
+            video = None
+        if rec.kind == "alert":
+            if video is None:
+                log.warning("the alert video %s.mp4 came out empty", rec.base.name)
+            else:
+                log.info("alert video saved: %s (about %d s, %.1f MB)", video.name, seconds, video.stat().st_size / 1e6)
             return
-        seconds = round(min(t, visit.until + self.cfg.video_before) - visit.start + self.cfg.video_before)
         if video is None:
-            log.warning("the visit video %s.mp4 came out empty", visit.base.name)
-            visit.base.with_suffix(".jpg").unlink(missing_ok=True)
+            log.warning("the visit video %s.mp4 came out empty", rec.base.name)
+            rec.base.with_suffix(".jpg").unlink(missing_ok=True)
             return
         try:
-            visit.base.with_suffix(".json").write_text(json.dumps(
-                {"label": visit.label, "confidence": round(visit.confidence, 2), "seconds": seconds}))
+            rec.base.with_suffix(".json").write_text(json.dumps(
+                {"label": rec.label, "confidence": round(rec.confidence, 2), "seconds": seconds}))
         except OSError as exc:
             log.warning("could not save the notes for %s: %s", video.name, exc)
-        log.info("%s visit saved: %s (about %d s, %.1f MB)", visit.label, video.name, seconds,
-                 video.stat().st_size / 1e6)
+        log.info("%s visit saved: %s (about %d s, %.1f MB)", rec.label, video.name, seconds, video.stat().st_size / 1e6)
+
+    def flush(self) -> None:
+        """Send alerts whose GIF is still being made, and finish a video now (pause, shutdown)."""
+        if self.recorder is not None:
+            self.recorder.flush()
+        if self.rec is not None:
+            self._finish(self._clock())
 
     def _reject(self, path: Path) -> None:
         """Keep the picture of a rejected movement in rejected/ (KEEP_REJECTED=yes), else delete it."""
@@ -1473,7 +1556,7 @@ class Control:
 
 
 EVENT_NAME = re.compile(r"^\d{4}-\d{2}-\d{2}_\d{6}\.jpg$")
-MEDIA_NAME = re.compile(r"^\d{4}-\d{2}-\d{2}_\d{6}\.(jpg|gif)$")
+MEDIA_NAME = re.compile(r"^\d{4}-\d{2}-\d{2}_\d{6}\.(jpg|gif|mp4)$")
 VISIT_NAME = re.compile(r"^\d{4}-\d{2}-\d{2}_\d{6}\.mp4$")
 VISIT_MEDIA = re.compile(r"^\d{4}-\d{2}-\d{2}_\d{6}\.(mp4|jpg)$")
 EVENT_FORMAT = "%Y-%m-%d_%H%M%S"
@@ -1644,6 +1727,7 @@ class App:
             return False
         path.unlink()
         path.with_suffix(".gif").unlink(missing_ok=True)
+        path.with_suffix(".mp4").unlink(missing_ok=True)
         self._names_at = float("-inf")  # rescan the folder on the next request
         return True
 
@@ -1673,6 +1757,9 @@ class App:
             clip = name[:-4] + ".gif"
             if (self.cfg.image_dir / clip).is_file():
                 event["clip"] = f"/pictures/{clip}"
+            video = name[:-4] + ".mp4"
+            if (self.cfg.image_dir / video).is_file():
+                event["video"] = f"/pictures/{video}"
             events.append(event)
         return events
 
@@ -1768,20 +1855,19 @@ def make_handler(app: App):
         def _picture(self, name: str, download: bool = False) -> None:
             if not MEDIA_NAME.match(name):  # no slashes, one dot: nothing outside the picture folder
                 return self._send(404, b"not found")
-            try:
-                data = (cfg.image_dir / name).read_bytes()
-            except OSError:
-                return self._send(404, b"not found")
-            ctype = "image/gif" if name.endswith(".gif") else "image/jpeg"
-            extra = {"Content-Disposition": f'attachment; filename="homesec_{name}"'} if download else None
-            self._send(200, data, ctype, "private, max-age=3600", extra)
+            self._file(cfg.image_dir / name, f"homesec_{name}", download)
 
         def _video(self, name: str, download: bool) -> None:
-            """Visit videos and their pictures. Supports byte ranges: browsers (Safari above all) need
-            them to play and seek in a video."""
+            """Visit videos and their pictures."""
             if not VISIT_MEDIA.match(name):
                 return self._send(404, b"not found")
-            path = app.visit_dir / name
+            self._file(app.visit_dir / name, f"homesec_visit_{name}", download)
+
+        def _file(self, path: Path, download_name: str, download: bool) -> None:
+            """A picture or video. Supports byte ranges: browsers (Safari above all) need them to play
+            and seek in a video."""
+            name = path.name
+            types = {".mp4": "video/mp4", ".gif": "image/gif"}
             try:
                 size = path.stat().st_size
                 handle = path.open("rb")
@@ -1799,13 +1885,13 @@ def make_handler(app: App):
                     if start > end or start >= size:
                         return self._send(416, b"range not satisfiable", extra={"Content-Range": f"bytes */{size}"})
                 self.send_response(206 if ranged and (ranged.group(1) or ranged.group(2)) else 200)
-                self.send_header("Content-Type", "video/mp4" if name.endswith(".mp4") else "image/jpeg")
+                self.send_header("Content-Type", types.get(path.suffix, "image/jpeg"))
                 self.send_header("Content-Length", str(end - start + 1))
                 self.send_header("Accept-Ranges", "bytes")
                 if ranged and (ranged.group(1) or ranged.group(2)):
                     self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
                 if download:
-                    self.send_header("Content-Disposition", f'attachment; filename="homesec_visit_{name}"')
+                    self.send_header("Content-Disposition", f'attachment; filename="{download_name}"')
                 self.send_header("Cache-Control", "private, max-age=3600")
                 for key, value in security.items():
                     self.send_header(key, value)
@@ -1955,6 +2041,9 @@ def cmd_run(cfg: Config) -> int:
         camera.start()
         server = start_web(app)
         watcher = Watcher(cfg, camera, mailer, control=control, slack=slack, check=check)
+        if watcher.alert_videos:
+            log.info("alert videos on: from %.0f s before an alert until %.0f s after the movement stopped "
+                     "(at most %.0f s)", cfg.video_before, cfg.video_after, cfg.video_max)
         if watcher.visits:
             app.record = cfg.record_objects
             log.info("recording visits of %s (%.0f s before to %.0f s after, %.0f fps)", ", ".join(cfg.record_objects),

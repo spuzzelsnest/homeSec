@@ -233,15 +233,25 @@
 
   function openPicture(event) {
     viewing = { ...event, kind: 'event' };
-    showMedia(false);
-    el.lightboxImg.src = event.clip || event.url;  // the clip (seconds before and after) when there is one
-    el.lightboxCaption.textContent = `${event.date}  ${event.time}${event.clip ? '  · clip' : ''}`;
+    const moving = event.video || event.clip;  // the alert video, or the older GIF clip
+    showMedia(Boolean(event.video));
+    if (event.video) {
+      el.lightboxVideo.src = event.video;
+      el.lightboxVideo.poster = event.url;
+    } else {
+      el.lightboxImg.src = event.clip || event.url;
+    }
+    el.lightboxCaption.textContent = `${event.date}  ${event.time}${event.video ? '  · video' : event.clip ? '  · clip' : ''}`;
     el.lightboxDownload.textContent = 'Picture';
     el.lightboxDownload.href = download(event.url);
-    el.lightboxClip.hidden = !event.clip;
-    if (event.clip) el.lightboxClip.href = download(event.clip);
+    el.lightboxClip.hidden = !moving;
+    if (moving) {
+      el.lightboxClip.textContent = event.video ? 'Video' : 'Clip';
+      el.lightboxClip.href = download(moving);
+    }
     disarmViewer();
     el.lightbox.showModal();
+    if (event.video) el.lightboxVideo.play().catch(() => { /* the person can press play */ });
   }
 
   function openVisit(visit) {
@@ -400,17 +410,20 @@
       button.type = 'button';
       button.className = 'event';
       button.setAttribute('aria-label', `Open the picture from ${event.date} ${event.time}`);
+      const thumb = document.createElement('div');
+      thumb.className = event.video ? 'thumb play' : 'thumb';
       const img = document.createElement('img');
       img.src = event.url;
       img.alt = '';
       img.loading = 'lazy';
+      thumb.append(img);
       const text = document.createElement('div');
       const time = document.createElement('b');
       time.textContent = event.time;
       const day = document.createElement('span');
       day.textContent = event.date === today ? 'Today' : event.date;
       text.append(time, day);
-      button.append(img, text);
+      button.append(thumb, text);
       button.addEventListener('click', () => openPicture(event));
       li.append(button, eventActions(event));
       el.events.append(li);
