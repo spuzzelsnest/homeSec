@@ -1023,9 +1023,9 @@
       box.dataset.level = d.level;
       $('stats-free').textContent = size(d.free);
       const pct = (n) => (d.total ? (100 * n) / d.total : 0);
-      $('stats-pace').textContent = `${Math.round(pct(d.free))}% of ${size(d.total)}`
-        + (st.days_left == null ? '' : st.days_left > 365 ? ' · enough for more than a year at this pace'
-          : ` · full in about ${st.days_left < 1 ? 'less than a day' : `${Math.round(st.days_left)} days`} at this week's pace`);
+      $('stats-pct').textContent = `${Math.round(pct(d.free))}% of ${size(d.total)}`;
+      $('kpi-full').textContent = st.days_left == null ? '—' : st.days_left > 365 ? '> 1 year'
+        : st.days_left < 1 ? '< 1 day' : `${Math.round(st.days_left)} days`;
       const f = d.files || {};
       const b = (k) => (f[k] ? f[k].bytes : 0);
       $('sbar-jpg').style.width = `${pct(b('jpg'))}%`;
@@ -1047,11 +1047,14 @@
       }
     }
     const hist = st.history;
-    $('stats-history').textContent = hist && hist.since
-      ? `Since ${dayName(hist.since, dateText(serverNow()))}: ${hist.people} people, ${hist.visits} bird visits, ${hist.events} events in all. `
-        + `${hist.deleted} of them had their files deleted; the database keeps them as a log `
-        + `${st.history_days ? `for ${st.history_days} days` : 'forever'} (Files → deleted).`
-      : '';
+    if (hist) {
+      $('kpi-events').textContent = String(hist.events);
+      $('kpi-since').textContent = hist.since ? `since ${dayName(hist.since, dateText(serverNow()))}` : 'none yet';
+      $('kpi-people').textContent = String(hist.people);
+      $('kpi-birds').textContent = String(hist.visits);
+      $('kpi-deleted').textContent = String(hist.deleted);
+      $('kpi-log-sub').textContent = st.history_days ? `kept ${st.history_days} days` : 'kept forever';
+    }
     if (st.events) renderEventStats(st.events);
     // space per day
     const chart = $('chart');
@@ -1068,7 +1071,7 @@
       col.title = `${x.date}: pictures ${size(x.jpg)}, GIFs ${size(x.gif)}, videos ${size(x.mp4)}`;
       const total = document.createElement('span');
       total.className = 'total';
-      total.textContent = totals[i] ? size(totals[i]) : '';
+      total.textContent = totals[i] ? size(totals[i]).replace(/ (k|M|G)B$/, '$1') : '';
       col.append(total);
       for (const k of ['mp4', 'gif', 'jpg']) {
         const s2 = document.createElement('span');
@@ -1169,6 +1172,10 @@
     $('keep-note').textContent = `Kept automatically: alerts and rejected pictures ${st.keep.alerts} days, bird visits ${st.keep.visits} days `
       + '(KEEP_DAYS and VISIT_KEEP_DAYS in /etc/homesec/homesec.env).';
   }
+
+  const openLog = () => { files.folder = 'deleted'; files.pick = null; location.hash = '#files'; };
+  $('kpi-log').addEventListener('click', openLog);
+  $('kpi-log').addEventListener('keydown', (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); openLog(); } });
 
   // ---------- the tabs: #live, #files, #stats
   const VIEWS = ['live', 'files', 'stats'];
