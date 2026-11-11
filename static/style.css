@@ -652,6 +652,18 @@ dialog .close { position: absolute; top: 10px; right: 10px; }
 .preview-files .fname { font: 0.75rem ui-monospace, SFMono-Regular, Menlo, monospace; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .preview-files .fsize { font-size: 0.75rem; color: var(--muted); }
 .preview-actions { display: flex; gap: 8px; margin-top: auto; }
+.preview-actions[hidden] { display: none; }
+.preview-none { height: 100%; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 10px; padding: 16px; color: var(--muted); font-size: 0.82rem; text-align: center; background: #0a1017; }
+.preview-none[hidden] { display: none; }
+.preview-none svg { width: 34px; height: 34px; }
+.preview-files li.gone { opacity: 0.75; border-style: dashed; background: transparent; }
+.preview-files li.gone .fname, .preview-files li.gone .fsize { text-decoration: line-through; }
+.preview-files li.gone small { grid-column: 2 / -1; font-size: 0.7rem; color: var(--muted); margin-top: -4px; }
+.row .pic.gone { display: grid; place-items: center; color: #4b5a6c; border: 1px dashed var(--panel-edge); background: transparent; }
+.row .pic.gone svg { width: 18px; height: 18px; }
+.row.gone .size { text-decoration: line-through; color: var(--muted); }
+.row.gone .kind { opacity: 0.55; text-decoration: line-through; }
+.row .why { font-size: 0.7rem; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .preview-actions .tool { flex: 1; min-height: 42px; font-weight: 700; }
 .tool.primary { background: var(--accent); border-color: var(--accent); color: #04201c; }
 .tool.primary:hover { filter: brightness(1.08); }

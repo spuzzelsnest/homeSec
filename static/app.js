@@ -638,8 +638,11 @@
 
   // ---------- Files: folders | the events in a folder | a preview of the chosen event
   const $ = (id) => document.getElementById(id);
-  const files = { folder: 'all', events: [], folders: {}, pick: null, query: '', sort: 'new' };
-  const FOLDERS = { all: ['All events', '#2dd4bf'], alerts: ['alerts', '#fb7185'], visits: ['visits', '#60a5fa'], rejected: ['rejected', '#8b9bb0'] };
+  const files = { folder: 'all', events: [], deleted: [], folders: {}, historyDays: 0, pick: null, query: '', sort: 'new' };
+  const FOLDERS = { all: ['All events', '#2dd4bf'], alerts: ['alerts', '#fb7185'], visits: ['visits', '#60a5fa'], rejected: ['rejected', '#8b9bb0'], deleted: ['deleted (log)', '#5b6b7f'] };
+  const TRASH = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 7h16M9 7V4h6v3M6 7l1 13h10l1-13"/></svg>';
+  const whenText = (stamp, today) => (stamp ? `${dayName(stamp.slice(0, 10), today)} ${stamp.slice(11, 16)}` : '');
+  const findPick = () => files.events.find((x) => x.id === files.pick) || files.deleted.find((x) => x.id === files.pick);
   const FOLDER_ICON = (color) => `<svg viewBox="0 0 24 24" fill="none" stroke="${color}" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>`;
   const fileOf = (e, kind) => e.files.find((f) => f.kind === kind);
 
@@ -647,9 +650,11 @@
     try {
       const data = await getJSON('/api/files');
       files.events = data.events;
+      files.deleted = data.deleted || [];
+      files.historyDays = data.history_days;
       files.folders = data.folders;
       $('files-path').textContent = data.path;
-      if (files.pick && !files.events.some((e) => e.id === files.pick)) files.pick = null;
+      if (files.pick && !findPick()) files.pick = null;
       renderFiles();
     } catch (err) { /* the next refresh tries again */ }
   }
@@ -660,11 +665,14 @@
     const tree = $('tree');
     tree.replaceChildren();
     for (const [id, [name, color]] of Object.entries(FOLDERS)) {
-      const list = id === 'all' ? Object.values(files.folders) : [files.folders[id] || { events: 0, bytes: 0 }];
+      const list = id === 'all' ? Object.entries(files.folders).filter(([k]) => k !== 'deleted').map(([, f]) => f)
+        : [files.folders[id] || { events: 0, bytes: 0 }];
       const li = document.createElement('li');
       const b = document.createElement('button');
       b.type = 'button';
-      b.className = id === 'all' ? 'tree-item' : 'tree-item sub';
+      b.className = id === 'all' || id === 'deleted' ? 'tree-item' : 'tree-item sub';
+      if (id === 'deleted') b.title = 'Events whose files were deleted: the database keeps them as a log'
+        + (files.historyDays ? ` for ${files.historyDays} days` : '');
       b.setAttribute('aria-current', String(files.folder === id));
       b.innerHTML = FOLDER_ICON(color);
       const n = document.createElement('span');
@@ -672,7 +680,7 @@
       n.textContent = `${name} (${list.reduce((a, f) => a + f.events, 0)})`;
       const z = document.createElement('span');
       z.className = 'size';
-      z.textContent = size(list.reduce((a, f) => a + f.bytes, 0));
+      z.textContent = id === 'deleted' ? 'log' : size(list.reduce((a, f) => a + f.bytes, 0));
       b.append(n, z);
       b.addEventListener('click', () => { files.folder = id; renderFiles(); });
       li.append(b);
@@ -680,30 +688,36 @@
     }
     // events
     const q = files.query.trim().toLowerCase();
-    let shown = files.events.filter((e) => files.folder === 'all' || e.folder === files.folder);
+    const log = files.folder === 'deleted';
+    let shown = log ? files.deleted : files.events.filter((e) => files.folder === 'all' || e.folder === files.folder);
     if (q) {
-      shown = shown.filter((e) => [e.date, e.time, e.label, e.folder, dayName(e.date, today)].join(' ').toLowerCase().includes(q));
+      shown = shown.filter((e) => [e.date, e.time, e.label, e.folder, dayName(e.date, today), e.deleted_by || '']
+        .join(' ').toLowerCase().includes(q));
     }
     shown = [...shown].sort(files.sort === 'old' ? (a, b) => a.ts - b.ts : files.sort === 'big' ? (a, b) => b.bytes - a.bytes : (a, b) => b.ts - a.ts);
     $('folder-name').textContent = FOLDERS[files.folder][0];
-    $('folder-count').textContent = `· ${shown.length} event${shown.length === 1 ? '' : 's'} · ${size(shown.reduce((a, e) => a + e.bytes, 0))}`;
+    $('folder-count').textContent = log
+      ? `· ${shown.length} event${shown.length === 1 ? '' : 's'} whose files were deleted (${size(shown.reduce((a, e) => a + e.bytes, 0))} freed)`
+        + (files.historyDays ? ` · kept in the log for ${files.historyDays} days` : ' · kept forever')
+      : `· ${shown.length} event${shown.length === 1 ? '' : 's'} · ${size(shown.reduce((a, e) => a + e.bytes, 0))}`;
     const rows = $('rows');
     rows.replaceChildren();
     if (!shown.length) {
       const li = document.createElement('li');
       li.className = 'empty';
-      li.textContent = q ? 'Nothing matches the search.' : 'No files here.';
+      li.textContent = q ? 'Nothing matches the search.' : log ? 'Nothing deleted yet.' : 'No files here.';
       rows.append(li);
     }
     for (const e of shown) {
       const li = document.createElement('li');
       const b = document.createElement('button');
       b.type = 'button';
-      b.className = 'row';
+      b.className = log ? 'row gone' : 'row';
       b.setAttribute('aria-pressed', String(files.pick === e.id));
       const pic = document.createElement('span');
-      pic.className = 'pic';
-      const jpg = fileOf(e, 'jpg');
+      pic.className = log ? 'pic gone' : 'pic';
+      const jpg = log ? null : fileOf(e, 'jpg');
+      if (log) pic.innerHTML = TRASH;
       if (jpg) {
         const img = document.createElement('img');
         img.src = jpg.url;
@@ -719,9 +733,20 @@
       w.className = `what ${e.label}`;
       w.textContent = [e.label, sure(e.confidence)].filter(Boolean).join(' · ');
       when.append(t, w);
+      if (log) {
+        const why = document.createElement('span');
+        why.className = 'why';
+        why.textContent = `${whenText(e.deleted_at, today)} · ${e.deleted_by}`;
+        when.append(why);
+      } else if (e.gone && e.gone.length) {
+        const why = document.createElement('span');
+        why.className = 'why';
+        why.textContent = `${e.gone.map((f) => f.kind).join(', ')} deleted`;
+        when.append(why);
+      }
       const kinds = document.createElement('span');
       kinds.className = 'kinds';
-      for (const f of e.files) {
+      for (const f of log ? e.gone : e.files) {
         const k = document.createElement('span');
         k.className = `kind ${f.kind}`;
         k.textContent = f.kind;
@@ -741,8 +766,27 @@
   $('files-search').addEventListener('input', (e) => { files.query = e.target.value; renderFiles(); });
   $('files-sort').addEventListener('change', (e) => { files.sort = e.target.value; renderFiles(); });
 
+  function goneItem(f, today) {
+    const li = document.createElement('li');
+    li.className = 'gone';
+    const k = document.createElement('span');
+    k.className = `kind ${f.kind}`;
+    k.textContent = f.kind;
+    const n = document.createElement('span');
+    n.className = 'fname';
+    n.textContent = f.name;
+    const z = document.createElement('span');
+    z.className = 'fsize';
+    z.textContent = size(f.bytes);
+    const why = document.createElement('small');
+    why.textContent = `deleted ${whenText(f.deleted_at, today)} · ${f.deleted_by || 'gone from disk'}`;
+    li.append(k, n, z, document.createElement('span'), why);
+    return li;
+  }
+
   function renderPreview(today) {
-    const e = files.events.find((x) => x.id === files.pick);
+    const e = findPick();
+    const log = Boolean(e && e.deleted_at);
     const body = $('preview-body');
     document.querySelector('#preview .pick-hint').hidden = Boolean(e);
     body.hidden = !e;
@@ -752,7 +796,15 @@
       video.removeAttribute('src');
       return;
     }
-    if (body.dataset.id !== e.id) {     // a different event: new media
+    $('preview-none').hidden = !log;
+    $('preview-actions').hidden = log;
+    if (log) {
+      body.dataset.id = e.id;
+      video.pause();
+      video.removeAttribute('src');
+      video.hidden = true;
+      $('preview-img').hidden = true;
+    } else if (body.dataset.id !== e.id) {     // a different event: new media
       body.dataset.id = e.id;
       const mp4 = fileOf(e, 'mp4');
       const still = fileOf(e, 'jpg') || fileOf(e, 'gif');
@@ -774,11 +826,17 @@
     $('preview-title').textContent = `${e.label} · ${dayName(e.date, today)} ${e.time}`;
     $('preview-detail').textContent = [sure(e.confidence), e.seconds ? `video ${e.seconds} s` : ''].filter(Boolean).join(' · ') || (e.folder === 'rejected' ? 'movement, but no person or bird seen' : 'picture only');
     $('preview-folder').textContent = e.folder;
-    $('preview-keep').textContent = e.keep_until;
-    $('preview-size').textContent = `${size(e.bytes)} in ${e.files.length} file${e.files.length === 1 ? '' : 's'}`;
+    $('preview-keep-dt').textContent = log ? 'Log kept until' : 'Kept until';
+    $('preview-keep').textContent = log ? (e.log_until || 'forever') : e.keep_until;
+    $('preview-gone-dt').hidden = !log;
+    $('preview-gone').hidden = !log;
+    if (log) $('preview-gone').textContent = `${whenText(e.deleted_at, today)} · ${e.deleted_by}`;
+    const n = log ? e.gone.length : e.files.length;
+    $('preview-size').textContent = `${size(e.bytes)} in ${n} file${n === 1 ? '' : 's'}${log ? ', deleted' : ''}`;
     const list = $('preview-files');
     list.replaceChildren();
-    for (const f of e.files) {
+    for (const f of log ? e.gone : []) list.append(goneItem(f, today));
+    for (const f of log ? [] : e.files) {
       const li = document.createElement('li');
       const k = document.createElement('span');
       k.className = `kind ${f.kind}`;
@@ -792,6 +850,7 @@
       li.append(k, n, z, iconLink(download(f.url), `Download ${f.name}`, ICONS.download));
       list.append(li);
     }
+    for (const f of log ? [] : e.gone || []) list.append(goneItem(f, today));
   }
 
   $('preview-play').addEventListener('click', () => {
@@ -989,7 +1048,9 @@
     }
     const hist = st.history;
     $('stats-history').textContent = hist && hist.since
-      ? `Since ${dayName(hist.since, dateText(serverNow()))}: ${hist.people} people, ${hist.visits} bird visits, ${hist.events} events in all (kept in the database, also after the files are deleted)`
+      ? `Since ${dayName(hist.since, dateText(serverNow()))}: ${hist.people} people, ${hist.visits} bird visits, ${hist.events} events in all. `
+        + `${hist.deleted} of them had their files deleted; the database keeps them as a log `
+        + `${st.history_days ? `for ${st.history_days} days` : 'forever'} (Files → deleted).`
       : '';
     if (st.events) renderEventStats(st.events);
     // space per day

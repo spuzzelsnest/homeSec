@@ -266,6 +266,7 @@ class Config:
     db_file: Path
     login: bool
     session_hours: int
+    history_days: int
     tls: str
     tls_cert: Path
     tls_key: Path
@@ -386,6 +387,7 @@ class Config:
             db_file=Path(r.text("DB_FILE")) if r.text("DB_FILE") else Path(r.text("IMAGE_DIR", "/var/lib/homesec")) / "homesec.db",
             login=r.flag("LOGIN", True),
             session_hours=r.number("SESSION_HOURS", 720, int, 1, 8760),  # 30 days with "keep me signed in"
+            history_days=r.number("HISTORY_DAYS", 365, int, 0, 36500),  # the log outlives the files; 0 = forever
             tls=r.choice("TLS", "auto", ("auto", "on", "off")),
             tls_cert=Path(r.text("TLS_CERT", "/etc/homesec/tls/cert.pem")),
             tls_key=Path(r.text("TLS_KEY", "/etc/homesec/tls/key.pem")),
@@ -1619,7 +1621,7 @@ class Store:
     One connection, shared by the web threads and the detection loop behind a lock; WAL mode, so reads
     do not wait for writes."""
 
-    VERSION = 1
+    VERSION = 2
     SCHEMA = (
         """CREATE TABLE events (
              id INTEGER PRIMARY KEY,
@@ -1632,6 +1634,7 @@ class Store:
              started_at TEXT NOT NULL,          -- local time, 2026-11-11 01:42:02
              created_at TEXT NOT NULL,
              deleted_at TEXT,                   -- set when all its files are gone; the row stays as history
+             deleted_by TEXT,                   -- why: "deleted by jan", "older than 7 days", ...
              UNIQUE (folder, stem))""",
         "CREATE INDEX events_started ON events (started_at)",
         """CREATE TABLE files (
@@ -1642,6 +1645,7 @@ class Store:
              bytes INTEGER NOT NULL,
              created_at TEXT NOT NULL,
              deleted_at TEXT,
+             deleted_by TEXT,
              UNIQUE (event_id, name))""",
         """CREATE TABLE users (
              id INTEGER PRIMARY KEY,
@@ -1695,6 +1699,13 @@ class Store:
                     db.execute(statement)
                 db.execute(f"PRAGMA user_version={self.VERSION}")
             log.info("database created: %s", self.path)
+            return
+        if version < 2:  # 2: why the files went
+            with self.tx() as db:
+                db.execute("ALTER TABLE events ADD COLUMN deleted_by TEXT")
+                db.execute("ALTER TABLE files ADD COLUMN deleted_by TEXT")
+                db.execute("PRAGMA user_version=2")
+            log.info("database updated to version 2: %s", self.path)
 
     @contextmanager
     def tx(self):
@@ -1717,12 +1728,13 @@ class Store:
             self._db.close()
 
     # ---- events and files
-    def sync(self, scanned: list, folders: tuple = ()) -> tuple:
+    def sync(self, scanned: list, folders: tuple = (), why: Optional[Callable] = None) -> tuple:
         """Make the database match the disk. `scanned` is what scan_disk() found (in `folders`, or all).
-        New events and files are added, changed ones updated, missing ones marked deleted.
-        Returns (events added, events marked deleted)."""
+        New events and files are added, changed ones updated, missing ones marked deleted, with
+        why(folder, stem, started_at) as the reason. Returns (events added, events marked deleted)."""
         now = self.now()
         added = gone = 0
+        reason = why or (lambda folder, stem, started: "gone from disk")
         with self.tx() as db:
             seen = set()
             for e in scanned:
@@ -1740,24 +1752,28 @@ class Store:
                 else:
                     event_id = row["id"]
                     db.execute("UPDATE events SET label = ?, confidence = ?, area = COALESCE(?, area), seconds = ?, "
-                               "deleted_at = NULL WHERE id = ?",
+                               "deleted_at = NULL, deleted_by = NULL WHERE id = ?",
                                (e["label"], e["confidence"], e.get("area"), e["seconds"], event_id))
                 names = []
                 for f in e["files"]:
                     names.append(f["name"])
                     db.execute("INSERT INTO files (event_id, name, kind, bytes, created_at) VALUES (?, ?, ?, ?, ?) "
-                               "ON CONFLICT (event_id, name) DO UPDATE SET bytes = excluded.bytes, deleted_at = NULL",
+                               "ON CONFLICT (event_id, name) DO UPDATE SET bytes = excluded.bytes, deleted_at = NULL, deleted_by = NULL",
                                (event_id, f["name"], f["kind"], f["bytes"], now))
                 marks = ",".join("?" * len(names))
-                db.execute(f"UPDATE files SET deleted_at = ? WHERE event_id = ? AND deleted_at IS NULL "
-                           f"AND name NOT IN ({marks})", (now, event_id, *names))
+                if db.execute(f"SELECT 1 FROM files WHERE event_id = ? AND deleted_at IS NULL AND name NOT IN ({marks})",
+                              (event_id, *names)).fetchone():
+                    db.execute(f"UPDATE files SET deleted_at = ?, deleted_by = ? WHERE event_id = ? AND deleted_at IS NULL "
+                               f"AND name NOT IN ({marks})",
+                               (now, reason(e["folder"], e["stem"], f"{e['date']} {e['time']}"), event_id, *names))
             where = f"AND folder IN ({','.join('?' * len(folders))})" if folders else ""
-            for row in db.execute(f"SELECT id, folder, stem FROM events WHERE deleted_at IS NULL {where}",
+            for row in db.execute(f"SELECT id, folder, stem, started_at FROM events WHERE deleted_at IS NULL {where}",
                                   tuple(folders)).fetchall():
                 if (row["folder"], row["stem"]) not in seen:
-                    db.execute("UPDATE events SET deleted_at = ? WHERE id = ?", (now, row["id"]))
-                    db.execute("UPDATE files SET deleted_at = ? WHERE event_id = ? AND deleted_at IS NULL",
-                               (now, row["id"]))
+                    why_gone = reason(row["folder"], row["stem"], row["started_at"])
+                    db.execute("UPDATE events SET deleted_at = ?, deleted_by = ? WHERE id = ?", (now, why_gone, row["id"]))
+                    db.execute("UPDATE files SET deleted_at = ?, deleted_by = ? WHERE event_id = ? AND deleted_at IS NULL",
+                               (now, why_gone, row["id"]))
                     gone += 1
         return added, gone
 
@@ -1767,14 +1783,47 @@ class Store:
         files: dict = {}
         for f in self.rows("SELECT event_id, name, kind, bytes FROM files WHERE deleted_at IS NULL"):
             files.setdefault(f["event_id"], []).append(f)
+        gone: dict = {}
+        for f in self.rows("SELECT f.event_id, f.name, f.kind, f.bytes, f.deleted_at, f.deleted_by FROM files f "
+                           "JOIN events e ON e.id = f.event_id WHERE e.deleted_at IS NULL AND f.deleted_at IS NOT NULL"):
+            gone.setdefault(f["event_id"], []).append(f)
         out = []
         order = {"mp4": 0, "jpg": 1, "gif": 2}
         for e in events:
             fs = sorted(files.get(e["id"], []), key=lambda f: order.get(f["kind"], 9))
             if not fs:
                 continue
-            out.append({**e, "files": fs})
+            out.append({**e, "files": fs, "gone": gone.get(e["id"], [])})
         return out
+
+    def deleted(self, limit: int = 300) -> tuple:
+        """The log of events whose files are all gone, newest deletion first: (events, how many in all)."""
+        total = self.rows("SELECT COUNT(*) AS n, COALESCE(SUM(b), 0) AS bytes FROM (SELECT SUM(f.bytes) AS b FROM events e "
+                          "LEFT JOIN files f ON f.event_id = e.id WHERE e.deleted_at IS NOT NULL GROUP BY e.id)")[0]
+        events = self.rows("SELECT * FROM events WHERE deleted_at IS NOT NULL ORDER BY deleted_at DESC, started_at DESC "
+                           "LIMIT ?", (limit,))
+        files: dict = {}
+        if events:
+            ids = [e["id"] for e in events]
+            for f in self.rows(f"SELECT event_id, name, kind, bytes, deleted_at, deleted_by FROM files "
+                               f"WHERE event_id IN ({','.join('?' * len(ids))})", tuple(ids)):
+                files.setdefault(f["event_id"], []).append(f)
+        order = {"mp4": 0, "jpg": 1, "gif": 2}
+        return ([{**e, "gone": sorted(files.get(e["id"], []), key=lambda f: order.get(f["kind"], 9))} for e in events],
+                total)
+
+    def prune_history(self, days: int) -> int:
+        """Forget deleted events (and audit lines) older than `days` days; drop expired sessions.
+        days 0 keeps the history forever. Returns how many events were forgotten."""
+        now = self.now()
+        with self.tx() as db:
+            db.execute("DELETE FROM sessions WHERE expires_at < ?", (now,))
+            if not days:
+                return 0
+            cutoff = f"{datetime.now() - timedelta(days=days):%Y-%m-%d %H:%M:%S}"
+            n = db.execute("DELETE FROM events WHERE deleted_at IS NOT NULL AND deleted_at < ?", (cutoff,)).rowcount
+            db.execute("DELETE FROM audit WHERE at < ?", (cutoff,))
+        return n
 
     def history(self) -> dict:
         """All events ever seen, also those whose files were deleted: the database's memory."""
@@ -1785,7 +1834,8 @@ class Store:
                 "people": count(lambda r: r["label"] == "person"),
                 "visits": count(lambda r: r["folder"] == "visits"),
                 "rejected": count(lambda r: r["folder"] == "rejected"),
-                "events": count(lambda r: True)}
+                "events": count(lambda r: True),
+                "deleted": self.rows("SELECT COUNT(*) AS n FROM events WHERE deleted_at IS NOT NULL")[0]["n"]}
 
     GROUP = ("CASE WHEN e.folder = 'visits' THEN 'birds' WHEN e.folder = 'rejected' THEN 'rejected' "
              "WHEN e.label = 'person' THEN 'people' ELSE 'other' END")
@@ -2006,6 +2056,8 @@ class App:
         self._failures: dict = {}        # ip or user name -> times of failed logins (lockout)
         self._dir_marks: dict = {}       # folder -> mtime of the folder at the last sync
         self._sync_lock = threading.Lock()
+        self._reasons: dict = {}        # (folder, stem) -> why its files are being deleted
+        self._pruned_at = float("-inf")
         self._catalog: Optional[list] = None
         self.control = control
         self.backend = backend
@@ -2126,12 +2178,13 @@ class App:
                 break
         return visits
 
-    def delete_visit(self, name: str) -> bool:
+    def delete_visit(self, name: str, by: str = "") -> bool:
         if not VISIT_NAME.match(name):
             return False
         path = self.visit_dir / name
         if not path.is_file():
             return False
+        self._deleting("visits", path.stem, deleted_by(by))
         path.unlink()
         for suffix in (".jpg", ".json"):
             path.with_suffix(suffix).unlink(missing_ok=True)
@@ -2139,13 +2192,14 @@ class App:
         self.ensure_synced(force=True)
         return True
 
-    def delete_event(self, name: str) -> bool:
+    def delete_event(self, name: str, by: str = "") -> bool:
         """Delete a saved picture and its clip. False when there is no such picture."""
         if not EVENT_NAME.match(name):
             return False
         path = self.cfg.image_dir / name
         if not path.is_file():
             return False
+        self._deleting("alerts", path.stem, deleted_by(by))
         path.unlink()
         path.with_suffix(".gif").unlink(missing_ok=True)
         path.with_suffix(".mp4").unlink(missing_ok=True)
@@ -2208,12 +2262,35 @@ class App:
             if not changed:
                 return
             folders = tuple(f for f, _ in changed)
-            added, gone = self.store.sync(self.scan_disk(folders), folders)
+            added, gone = self.store.sync(self.scan_disk(folders), folders, self._why_gone)
             if added or gone:
                 log.debug("database synced: %d new, %d gone (%s)", added, gone, ", ".join(folders))
             for folder, mark in changed:
                 self._dir_marks[folder] = mark
             self._catalog = None
+            if time.monotonic() - self._pruned_at > 86400:
+                self._pruned_at = time.monotonic()
+                forgotten = self.store.prune_history(self.cfg.history_days)
+                if forgotten:
+                    log.info("forgot %d deleted events older than %d days (HISTORY_DAYS)", forgotten,
+                             self.cfg.history_days)
+
+    def _why_gone(self, folder: str, stem: str, started: str) -> str:
+        """Why the files of an event went: a delete from the web page, the automatic clean-up, or unknown."""
+        why = self._reasons.pop((folder, stem), None)
+        if why:
+            return why
+        try:
+            age = datetime.now() - datetime.strptime(started, "%Y-%m-%d %H:%M:%S")
+        except ValueError:
+            age = timedelta(0)
+        days = self.keep_days(folder)
+        return f"older than {days} days, removed automatically" if age > timedelta(days=days) - timedelta(hours=1) \
+            else "gone from disk"
+
+    def _deleting(self, folder: str, stem: str, why: str) -> None:
+        """Note why, before the files of an event are deleted, for the database's log."""
+        self._reasons[(folder, stem)] = why
 
     def catalog(self) -> list:
         """Every saved event, with its files, from the database: what the timeline, Files and Stats show."""
@@ -2231,6 +2308,7 @@ class App:
                     "bytes": sum(f["bytes"] for f in e["files"]),
                     "files": [{"name": f["name"], "kind": f["kind"], "bytes": f["bytes"],
                                "url": FOLDER_URL[folder] + f["name"]} for f in e["files"]],
+                    "gone": [{k: f[k] for k in ("name", "kind", "bytes", "deleted_at", "deleted_by")} for f in e["gone"]],
                 })
             self._catalog = events
         return self._catalog
@@ -2287,12 +2365,30 @@ class App:
         for e in events:
             folders[e["folder"]]["events"] += 1
             folders[e["folder"]]["bytes"] += e["bytes"]
-        return {"folders": folders, "events": events, "path": str(self.cfg.image_dir)}
+        log_events, total = self.store.deleted()
+        deleted = []
+        for e in log_events:
+            stamp = datetime.strptime(e["started_at"], "%Y-%m-%d %H:%M:%S")
+            forget = (datetime.strptime(e["deleted_at"], "%Y-%m-%d %H:%M:%S") + timedelta(days=self.cfg.history_days)
+                      if self.cfg.history_days else None)
+            deleted.append({
+                "id": f"deleted/{e['folder']}/{e['stem']}", "folder": e["folder"], "stem": e["stem"],
+                "date": f"{stamp:%Y-%m-%d}", "time": f"{stamp:%H:%M:%S}", "ts": int(stamp.timestamp()),
+                "label": e["label"], "confidence": e["confidence"], "seconds": e["seconds"],
+                "deleted_at": e["deleted_at"], "deleted_by": e["deleted_by"] or "gone from disk",
+                "log_until": f"{forget:%Y-%m-%d}" if forget else "",
+                "bytes": sum(f["bytes"] for f in e["gone"]),
+                "gone": [{k: f[k] for k in ("name", "kind", "bytes", "deleted_at", "deleted_by")} for f in e["gone"]],
+            })
+        folders["deleted"] = {"events": total["n"], "bytes": total["bytes"]}
+        return {"folders": folders, "events": events, "deleted": deleted, "history_days": self.cfg.history_days,
+                "path": str(self.cfg.image_dir)}
 
-    def delete_files(self, folder: str, stem: str) -> int:
+    def delete_files(self, folder: str, stem: str, by: str = "", why: str = "") -> int:
         """Delete every file of one event in a folder. Returns how many files went."""
         if folder not in FOLDERS or not STEM.match(stem):
             return 0
+        self._deleting(folder, stem, why or deleted_by(by))
         removed = 0
         for suffix in ("jpg", "gif", "mp4", "json"):
             path = self.folder_path(folder) / f"{stem}.{suffix}"
@@ -2336,14 +2432,19 @@ class App:
                        "visits": sum(e["folder"] == "visits" for e in events)},
             "history": self.store.history(),
             "events": self.store.event_stats(),
+            "history_days": self.cfg.history_days,
         }
 
-    def cleanup(self, action: str, before: str = "") -> dict:
+    def cleanup(self, action: str, before: str = "", by: str = "") -> dict:
         """The Stats tab's clean-up buttons. Returns how many files and bytes went."""
         events = self.catalog()
         gone = {"files": 0, "bytes": 0}
+        what = {"rejected": "rejected pictures", "old_gifs": "GIFs older than 2 days",
+                "before": f"everything before {before}"}.get(action, action)
+        why = f"clean-up ({what}){f' by {by}' if by else ''}"
 
         def drop(folder: str, name: str, size: int) -> None:
+            self._deleting(folder, name.rsplit(".", 1)[0], why)
             try:
                 (self.folder_path(folder) / name).unlink()
                 gone["files"] += 1
@@ -2368,7 +2469,7 @@ class App:
                 raise ValueError("before must look like 2026-11-04")
             for e in events:
                 if e["date"] < before:
-                    gone["files"] += self.delete_files(e["folder"], e["stem"])
+                    gone["files"] += self.delete_files(e["folder"], e["stem"], why=why)
                     gone["bytes"] += e["bytes"]
         else:
             raise ValueError(f"unknown clean-up {action!r}")
@@ -2720,7 +2821,7 @@ def make_handler(app: App):
                 if folder not in FOLDERS or not STEM.match(stem):
                     return self._send(400, b"bad request")
                 try:
-                    removed = app.delete_files(folder, stem)
+                    removed = app.delete_files(folder, stem, self.user["name"])
                 except OSError as exc:
                     log.error("could not delete %s/%s: %s", folder, stem, exc)
                     return self._send(500, b"could not delete")
@@ -2732,7 +2833,7 @@ def make_handler(app: App):
             if path == "/api/cleanup":
                 action, before = form.get("action", [""])[0], form.get("before", [""])[0]
                 try:
-                    gone = app.cleanup(action, before)
+                    gone = app.cleanup(action, before, self.user["name"])
                 except ValueError:
                     return self._send(400, b"bad request")
                 except OSError as exc:
@@ -2747,7 +2848,7 @@ def make_handler(app: App):
                 if not VISIT_NAME.match(name):
                     return self._send(400, b"bad request")
                 try:
-                    if not app.delete_visit(name):
+                    if not app.delete_visit(name, self.user["name"]):
                         return self._send(404, b"not found")
                 except OSError as exc:
                     log.error("could not delete %s: %s", name, exc)
@@ -2760,7 +2861,7 @@ def make_handler(app: App):
                 if not EVENT_NAME.match(name):
                     return self._send(400, b"bad request")
                 try:
-                    if not app.delete_event(name):
+                    if not app.delete_event(name, self.user["name"]):
                         return self._send(404, b"not found")
                 except OSError as exc:
                     log.error("could not delete %s: %s", name, exc)
@@ -2808,6 +2909,10 @@ def make_handler(app: App):
             log.debug("web: " + fmt, *args)
 
     return Handler
+
+
+def deleted_by(user: str) -> str:
+    return f"deleted by {user}" if user else "deleted from the web page"
 
 
 def html_escape(text: str) -> str:
