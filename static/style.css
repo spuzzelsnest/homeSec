@@ -214,6 +214,32 @@ h2 {
 .facts div { display: flex; justify-content: space-between; gap: 12px; }
 .facts dt { color: var(--muted); }
 .facts dd { font-weight: 650; text-align: right; font-variant-numeric: tabular-nums; }
+.facts .disk { flex-wrap: wrap; row-gap: 6px; }
+.facts .disk[hidden] { display: none; }
+.diskbar {
+  display: flex;
+  flex-basis: 100%;
+  height: 6px;
+  border-radius: 999px;
+  overflow: hidden;
+  background: #0d151e;
+  border: 1px solid var(--panel-edge);
+}
+.diskbar span { height: 100%; }
+.k-jpg { background: var(--accent); }
+.k-gif { background: #a78bfa; }
+.k-mp4 { background: #60a5fa; }
+.k-rest { background: var(--accent); opacity: 0.4; }
+.k-other { background: var(--muted); opacity: 0.6; }
+.disk-kinds { list-style: none; margin: 0; padding: 0; justify-content: flex-start; flex-basis: 100%; display: flex; flex-wrap: wrap; gap: 4px 14px; font-size: 0.75rem; color: var(--muted); }
+.disk-kinds li { display: flex; align-items: center; gap: 5px; cursor: default; }
+.disk-kinds i { width: 8px; height: 8px; border-radius: 2px; flex: none; }
+.disk-kinds b { color: var(--text); font-weight: 600; font-variant-numeric: tabular-nums; }
+.disk small { flex-basis: 100%; font-size: 0.72rem; }
+.disk[data-level="warn"] dd { color: var(--warn); }
+.disk[data-level="warn"] .diskbar { border-color: var(--warn); }
+.disk[data-level="low"] dd { color: var(--danger); }
+.disk[data-level="low"] .diskbar { border-color: var(--danger); }
 
 /* ---- event log ---- */
 .log { min-height: 8rem; }

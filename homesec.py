@@ -29,6 +29,7 @@ import os
 import queue
 import re
 import select
+import shutil
 import signal
 import smtplib
 import socket
@@ -1671,10 +1672,62 @@ class App:
             "fps": cfg.fps,
             "viewers": self.hub.viewers,
             "uptime": int(time.time() - self.started),
+            "disk": self.disk(),
             "now": int(time.time()),
             "host": socket.gethostname(),
             "slack": {"enabled": bool(cfg.slack_webhook), "channel": cfg.slack_channel},
         }
+
+    DISK_TTL = 30.0  # seconds; counting the files every status poll would be wasteful
+
+    def disk(self) -> dict:
+        """Space on the disk with the pictures and videos, and how much of it is homeSec's own files."""
+        now = time.monotonic()
+        if now - getattr(self, "_disk_at", float("-inf")) < self.DISK_TTL:
+            return self._disk
+        try:
+            usage = shutil.disk_usage(self.cfg.image_dir)
+        except OSError:
+            self._disk, self._disk_at = None, now
+            return None
+        ours = 0
+        kinds = {kind: {"count": 0, "bytes": 0, "folders": {}} for kind in ("jpg", "gif", "mp4")}
+        folders = [self.cfg.image_dir]
+        while folders:
+            folder = folders.pop()
+            where = "alerts" if folder == self.cfg.image_dir else os.path.basename(folder)  # visits, rejected
+            try:
+                with os.scandir(folder) as entries:
+                    for entry in entries:
+                        try:
+                            if entry.is_dir(follow_symlinks=False):
+                                folders.append(entry.path)
+                            elif entry.is_file(follow_symlinks=False):
+                                size = entry.stat(follow_symlinks=False).st_size
+                                ours += size
+                                kind = kinds.get(entry.name.rsplit(".", 1)[-1].lower())
+                                if kind is not None:
+                                    kind["count"] += 1
+                                    kind["bytes"] += size
+                                    kind["folders"][where] = kind["folders"].get(where, 0) + 1
+                        except OSError:
+                            pass
+            except OSError:
+                pass
+        free_pct = 100.0 * usage.free / usage.total if usage.total else 0.0
+        level = "low" if usage.free < 1e9 or free_pct < 5 else "warn" if usage.free < 3e9 or free_pct < 10 else "ok"
+        if level != "ok" and getattr(self, "_disk_level", "ok") != level:
+            log.warning("disk space %s: %.1f GB free of %.1f GB (homeSec files: %.1f GB); delete old pictures and "
+                        "videos in the console, or lower KEEP_DAYS / VISIT_KEEP_DAYS", "very low" if level == "low"
+                        else "getting low", usage.free / 1e9, usage.total / 1e9, ours / 1e9)
+        self._disk_level = level
+        self._disk = {"total": usage.total, "free": usage.free, "homesec": ours, "level": level, "files": kinds}
+        self._disk_at = now
+        return self._disk
+
+    def forget_disk(self) -> None:
+        """Count again on the next status (after a delete)."""
+        self._disk_at = float("-inf")
 
     @property
     def visit_dir(self) -> Path:
@@ -1716,6 +1769,7 @@ class App:
         path.unlink()
         for suffix in (".jpg", ".json"):
             path.with_suffix(suffix).unlink(missing_ok=True)
+        self.forget_disk()
         return True
 
     def delete_event(self, name: str) -> bool:
@@ -1729,6 +1783,7 @@ class App:
         path.with_suffix(".gif").unlink(missing_ok=True)
         path.with_suffix(".mp4").unlink(missing_ok=True)
         self._names_at = float("-inf")  # rescan the folder on the next request
+        self.forget_disk()
         return True
 
     def _visit_names(self) -> list:

@@ -9,7 +9,8 @@
     'overlay-text', 'stamp', 'motion-badge', 'fullscreen', 'stream-info', 'viewers', 'meter',
     'meter-fill', 'score', 'threshold', 'spark', 'events-today', 'last-motion', 'uptime', 'events',
     'alerts', 'lightbox', 'lightbox-img', 'lightbox-caption', 'lightbox-download', 'lightbox-clip',
-    'lightbox-delete', 'lightbox-video', 'visits-panel', 'visits', 'visits-what', 'visit-rec',
+    'lightbox-delete', 'disk', 'disk-free', 'disk-jpg', 'disk-gif', 'disk-mp4', 'disk-rest', 'disk-other',
+    'disk-detail', 'disk-kind-jpg', 'disk-kind-gif', 'disk-kind-mp4', 'lightbox-video', 'visits-panel', 'visits', 'visits-what', 'visit-rec',
   ].map((id) => [camel(id), document.getElementById(id)]));
 
   const POLL_MS = 600;       // status refresh while the page is visible
@@ -439,6 +440,31 @@
     }
   }
 
+  // ---------- disk
+  const size = (bytes) => (bytes >= 1e9 ? `${(bytes / 1e9).toFixed(1)} GB` : `${Math.round(bytes / 1e6)} MB`);
+
+  function renderDisk(d) {
+    el.disk.hidden = !d;
+    if (!d) return;
+    const pct = (n) => (d.total ? (100 * n) / d.total : 0);
+    el.diskFree.textContent = `${size(d.free)} (${Math.round(pct(d.free))}%)`;
+    const files = d.files || {};
+    let known = 0;
+    for (const kind of ['jpg', 'gif', 'mp4']) {
+      const f = files[kind] || { count: 0, bytes: 0, folders: {} };
+      known += f.bytes;
+      el[`disk${kind[0].toUpperCase()}${kind.slice(1)}`].style.width = `${pct(f.bytes)}%`;
+      const item = el[`diskKind${kind[0].toUpperCase()}${kind.slice(1)}`];
+      item.querySelector('b').textContent = `${f.count} · ${size(f.bytes)}`;
+      item.title = Object.entries(f.folders).map(([where, n]) => `${where}: ${n}`).join(', ') || 'none';
+    }
+    el.diskRest.style.width = `${Math.max(0, pct(d.homesec - known))}%`;  // homeSec's other files
+    el.diskOther.style.width = `${Math.max(0, pct(d.total - d.free - d.homesec))}%`;
+    el.diskDetail.textContent = `homeSec ${size(d.homesec)} · system ${size(Math.max(0, d.total - d.free - d.homesec))} · disk ${size(d.total)}`;
+    el.disk.dataset.level = d.level;
+    el.disk.title = d.level === 'ok' ? '' : 'Disk space is running out: delete old pictures and videos, or lower KEEP_DAYS / VISIT_KEEP_DAYS';
+  }
+
   // ---------- status
   function render(s) {
     status = s;
@@ -472,6 +498,7 @@
     el.eventsToday.textContent = String(s.events_today);
     el.lastMotion.textContent = s.last_motion ? `${s.last_motion.time} · ${ago(s.last_motion.ts)}` : '—';
     el.uptime.textContent = duration(s.uptime);
+    renderDisk(s.disk);
     el.streamInfo.textContent = `${s.resolution} · MJPEG · ${s.fps} fps`;
     el.viewers.textContent = s.viewers === 1 ? '1 viewer' : `${s.viewers} viewers`;
 
