@@ -23,6 +23,11 @@
         <p id="subtitle" class="muted">Connecting…</p>
       </div>
     </div>
+    <nav class="views" aria-label="Sections">
+      <a id="nav-live" class="view-tab" href="#live" aria-current="page">Live</a>
+      <a id="nav-files" class="view-tab" href="#files">Files</a>
+      <a id="nav-stats" class="view-tab" href="#stats">Stats</a>
+    </nav>
     <div class="actions">
       <button id="detection" class="pill" type="button" data-state="unknown" aria-pressed="false">
         <span class="dot" aria-hidden="true"></span><span id="detection-label">Detection</span>
@@ -33,6 +38,7 @@
     </div>
   </header>
 
+  <div id="view-live" class="view live">
   <main class="layout">
     <section class="panel viewer" aria-label="Live camera view">
       <div id="stage" class="stage">
@@ -111,6 +117,88 @@
       <li class="empty">Waiting for events…</li>
     </ol>
   </section>
+  </div>
+
+  <!-- Files: folders, the events in a folder, a preview of the chosen event -->
+  <div id="view-files" class="view files" hidden>
+    <aside class="tree" aria-label="Folders">
+      <h2>Folders</h2>
+      <ul id="tree" class="tree-list"></ul>
+      <p id="files-path" class="muted path"></p>
+    </aside>
+    <section class="listing" aria-label="Events">
+      <div class="listing-head">
+        <div><b id="folder-name">All events</b> <span id="folder-count" class="muted"></span></div>
+        <div class="listing-tools">
+          <label class="search">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="M20 20l-4-4"/></svg>
+            <input id="files-search" type="search" placeholder="Search date, time, person, bird" aria-label="Search events">
+          </label>
+          <label class="sort">Sort
+            <select id="files-sort" aria-label="Sort">
+              <option value="new">Newest first</option>
+              <option value="old">Oldest first</option>
+              <option value="big">Biggest first</option>
+            </select>
+          </label>
+        </div>
+      </div>
+      <ol id="rows" class="rows"></ol>
+    </section>
+    <aside id="preview" class="preview" aria-label="Preview">
+      <p class="muted pick-hint">Choose an event to see its files.</p>
+      <div id="preview-body" hidden>
+        <div class="preview-media">
+          <img id="preview-img" alt="Picture of the chosen event">
+          <video id="preview-video" controls playsinline muted hidden></video>
+        </div>
+        <h3 id="preview-title"></h3>
+        <p id="preview-detail" class="muted"></p>
+        <dl class="preview-facts">
+          <dt>Folder</dt><dd id="preview-folder"></dd>
+          <dt>Kept until</dt><dd id="preview-keep"></dd>
+          <dt>Total</dt><dd id="preview-size"></dd>
+        </dl>
+        <ul id="preview-files" class="preview-files"></ul>
+        <div class="preview-actions">
+          <button id="preview-play" class="tool primary" type="button">Play video</button>
+          <button id="preview-delete" class="tool danger" type="button">Delete event</button>
+        </div>
+      </div>
+    </aside>
+  </div>
+
+  <!-- Stats: disk space, space per day, clean-up -->
+  <div id="view-stats" class="view stats" hidden>
+    <section id="stats-disk" class="panel stats-disk">
+      <div>
+        <h2>Disk free</h2>
+        <p id="stats-free" class="big">—</p>
+        <p id="stats-pace" class="muted"></p>
+      </div>
+      <div>
+        <div class="stats-bar" role="img" aria-label="Disk use">
+          <span id="sbar-jpg" class="k-jpg"></span><span id="sbar-gif" class="k-gif"></span><span id="sbar-mp4" class="k-mp4"></span><span id="sbar-other" class="k-other"></span>
+        </div>
+        <ul id="stats-legend" class="stats-legend"></ul>
+      </div>
+    </section>
+    <div class="stats-grid">
+      <section class="panel chart-panel">
+        <h2>Space used per day · last 14 days</h2>
+        <div id="chart" class="chart" role="img" aria-label="Space used per day"></div>
+        <div id="chart-labels" class="chart-labels" aria-hidden="true"></div>
+        <p id="chart-note" class="muted chart-note"></p>
+      </section>
+      <section class="cleanup-panel">
+        <h2>Clean up</h2>
+        <ul id="cleanup" class="cleanup"></ul>
+        <h2 class="biggest-title">Biggest videos</h2>
+        <ol id="biggest" class="biggest"></ol>
+        <p id="keep-note" class="muted keep-note"></p>
+      </section>
+    </div>
+  </div>
 
   <dialog id="lightbox" aria-label="Captured picture">
     <form method="dialog">

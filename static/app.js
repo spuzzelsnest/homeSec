@@ -58,8 +58,9 @@
   }
 
   // ---------- live stream
+  let view = 'live';         // the open tab: live, files or stats
   function startStream() {
-    if (document.hidden || el.stream.getAttribute('src')) return;
+    if (document.hidden || view !== 'live' || el.stream.getAttribute('src')) return;
     streamError = false;
     el.stream.src = `/stream.mjpg?t=${Date.now()}`;
   }
@@ -533,7 +534,8 @@
   }
 
   // ---------- disk
-  const size = (bytes) => (bytes >= 1e9 ? `${(bytes / 1e9).toFixed(1)} GB` : `${Math.round(bytes / 1e6)} MB`);
+  const size = (bytes) => (!bytes ? '0 MB' : bytes >= 1e9 ? `${(bytes / 1e9).toFixed(1)} GB`
+    : bytes >= 1e6 ? `${(bytes / 1e6).toFixed(bytes >= 1e8 ? 0 : 1)} MB` : `${Math.max(1, Math.round(bytes / 1e3))} kB`);
 
   function renderDisk(d) {
     el.disk.hidden = !d;
@@ -606,6 +608,8 @@
     if (key !== eventsKey) {
       eventsKey = key;
       loadEvents();
+      if (view === 'files') loadFiles();
+      if (view === 'stats') loadStats();
     }
     updateLive();
   }
@@ -626,6 +630,365 @@
   }, 1000);
   window.addEventListener('resize', () => { drawSpark(); updateArrows(); });
 
-  startStream();
+  // ---------- Files: folders | the events in a folder | a preview of the chosen event
+  const $ = (id) => document.getElementById(id);
+  const files = { folder: 'all', events: [], folders: {}, pick: null, query: '', sort: 'new' };
+  const FOLDERS = { all: ['All events', '#2dd4bf'], alerts: ['alerts', '#fb7185'], visits: ['visits', '#60a5fa'], rejected: ['rejected', '#8b9bb0'] };
+  const FOLDER_ICON = (color) => `<svg viewBox="0 0 24 24" fill="none" stroke="${color}" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>`;
+  const fileOf = (e, kind) => e.files.find((f) => f.kind === kind);
+
+  async function loadFiles() {
+    try {
+      const data = await getJSON('/api/files');
+      files.events = data.events;
+      files.folders = data.folders;
+      $('files-path').textContent = data.path;
+      if (files.pick && !files.events.some((e) => e.id === files.pick)) files.pick = null;
+      renderFiles();
+    } catch (err) { /* the next refresh tries again */ }
+  }
+
+  function renderFiles() {
+    const today = dateText(serverNow());
+    // folders
+    const tree = $('tree');
+    tree.replaceChildren();
+    for (const [id, [name, color]] of Object.entries(FOLDERS)) {
+      const list = id === 'all' ? Object.values(files.folders) : [files.folders[id] || { events: 0, bytes: 0 }];
+      const li = document.createElement('li');
+      const b = document.createElement('button');
+      b.type = 'button';
+      b.className = id === 'all' ? 'tree-item' : 'tree-item sub';
+      b.setAttribute('aria-current', String(files.folder === id));
+      b.innerHTML = FOLDER_ICON(color);
+      const n = document.createElement('span');
+      n.className = 'name';
+      n.textContent = `${name} (${list.reduce((a, f) => a + f.events, 0)})`;
+      const z = document.createElement('span');
+      z.className = 'size';
+      z.textContent = size(list.reduce((a, f) => a + f.bytes, 0));
+      b.append(n, z);
+      b.addEventListener('click', () => { files.folder = id; renderFiles(); });
+      li.append(b);
+      tree.append(li);
+    }
+    // events
+    const q = files.query.trim().toLowerCase();
+    let shown = files.events.filter((e) => files.folder === 'all' || e.folder === files.folder);
+    if (q) {
+      shown = shown.filter((e) => [e.date, e.time, e.label, e.folder, dayName(e.date, today)].join(' ').toLowerCase().includes(q));
+    }
+    shown = [...shown].sort(files.sort === 'old' ? (a, b) => a.ts - b.ts : files.sort === 'big' ? (a, b) => b.bytes - a.bytes : (a, b) => b.ts - a.ts);
+    $('folder-name').textContent = FOLDERS[files.folder][0];
+    $('folder-count').textContent = `· ${shown.length} event${shown.length === 1 ? '' : 's'} · ${size(shown.reduce((a, e) => a + e.bytes, 0))}`;
+    const rows = $('rows');
+    rows.replaceChildren();
+    if (!shown.length) {
+      const li = document.createElement('li');
+      li.className = 'empty';
+      li.textContent = q ? 'Nothing matches the search.' : 'No files here.';
+      rows.append(li);
+    }
+    for (const e of shown) {
+      const li = document.createElement('li');
+      const b = document.createElement('button');
+      b.type = 'button';
+      b.className = 'row';
+      b.setAttribute('aria-pressed', String(files.pick === e.id));
+      const pic = document.createElement('span');
+      pic.className = 'pic';
+      const jpg = fileOf(e, 'jpg');
+      if (jpg) {
+        const img = document.createElement('img');
+        img.src = jpg.url;
+        img.alt = '';
+        img.loading = 'lazy';
+        pic.append(img);
+      }
+      const when = document.createElement('span');
+      when.className = 'when';
+      const t = document.createElement('b');
+      t.textContent = `${dayName(e.date, today)} ${e.time.slice(0, 5)}`;
+      const w = document.createElement('span');
+      w.className = `what ${e.label}`;
+      w.textContent = [e.label, sure(e.confidence)].filter(Boolean).join(' · ');
+      when.append(t, w);
+      const kinds = document.createElement('span');
+      kinds.className = 'kinds';
+      for (const f of e.files) {
+        const k = document.createElement('span');
+        k.className = `kind ${f.kind}`;
+        k.textContent = f.kind;
+        kinds.append(k);
+      }
+      const z = document.createElement('span');
+      z.className = 'size';
+      z.textContent = size(e.bytes);
+      b.append(pic, when, kinds, z);
+      b.addEventListener('click', () => { files.pick = e.id; renderFiles(); });
+      li.append(b);
+      rows.append(li);
+    }
+    renderPreview(today);
+  }
+
+  $('files-search').addEventListener('input', (e) => { files.query = e.target.value; renderFiles(); });
+  $('files-sort').addEventListener('change', (e) => { files.sort = e.target.value; renderFiles(); });
+
+  function renderPreview(today) {
+    const e = files.events.find((x) => x.id === files.pick);
+    const body = $('preview-body');
+    document.querySelector('#preview .pick-hint').hidden = Boolean(e);
+    body.hidden = !e;
+    const video = $('preview-video');
+    if (!e) {
+      video.pause();
+      video.removeAttribute('src');
+      return;
+    }
+    if (body.dataset.id !== e.id) {     // a different event: new media
+      body.dataset.id = e.id;
+      const mp4 = fileOf(e, 'mp4');
+      const still = fileOf(e, 'jpg') || fileOf(e, 'gif');
+      video.pause();
+      if (mp4) {
+        video.src = mp4.url;
+        if (still) video.poster = still.url; else video.removeAttribute('poster');
+      } else {
+        video.removeAttribute('src');
+        video.removeAttribute('poster');
+      }
+      video.hidden = !mp4;
+      $('preview-img').hidden = Boolean(mp4);
+      const pic = fileOf(e, 'gif') || still;
+      if (!mp4 && pic) $('preview-img').src = pic.url;
+      $('preview-play').hidden = !mp4;
+      disarmPreview();
+    }
+    $('preview-title').textContent = `${e.label} · ${dayName(e.date, today)} ${e.time}`;
+    $('preview-detail').textContent = [sure(e.confidence), e.seconds ? `video ${e.seconds} s` : ''].filter(Boolean).join(' · ') || (e.folder === 'rejected' ? 'movement, but no person or bird seen' : 'picture only');
+    $('preview-folder').textContent = e.folder;
+    $('preview-keep').textContent = e.keep_until;
+    $('preview-size').textContent = `${size(e.bytes)} in ${e.files.length} file${e.files.length === 1 ? '' : 's'}`;
+    const list = $('preview-files');
+    list.replaceChildren();
+    for (const f of e.files) {
+      const li = document.createElement('li');
+      const k = document.createElement('span');
+      k.className = `kind ${f.kind}`;
+      k.textContent = f.kind;
+      const n = document.createElement('span');
+      n.className = 'fname';
+      n.textContent = f.name;
+      const z = document.createElement('span');
+      z.className = 'fsize';
+      z.textContent = size(f.bytes);
+      li.append(k, n, z, iconLink(download(f.url), `Download ${f.name}`, ICONS.download));
+      list.append(li);
+    }
+  }
+
+  $('preview-play').addEventListener('click', () => {
+    const v = $('preview-video');
+    v.muted = false;
+    v.play().catch(() => { /* the person can press play in the player */ });
+  });
+
+  const disarmPreview = armable($('preview-delete'), 'Delete? Click again', async () => {
+    const e = files.events.find((x) => x.id === files.pick);
+    if (!e) return;
+    const response = await fetch('/api/files/delete', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: `folder=${encodeURIComponent(e.folder)}&stem=${encodeURIComponent(e.stem)}`,
+    });
+    if (!response.ok && response.status !== 404) throw new Error(String(response.status));
+    // the next event in the list gets the preview
+    const i = files.events.findIndex((x) => x.id === e.id);
+    files.events.splice(i, 1);
+    const shown = files.events.filter((x) => files.folder === 'all' || x.folder === files.folder);
+    files.pick = shown.length ? shown[Math.min(i, shown.length - 1)].id : null;
+    eventsKey = null;
+    visitsKey = null;
+    await loadFiles();
+  });
+
+  // ---------- Stats: disk space, space per day, clean-up
+  const cleanupDone = {};     // what the last clean-up removed, shown until the page is reloaded
+  async function loadStats() {
+    try {
+      renderStats(await getJSON('/api/stats'));
+    } catch (err) { /* the next refresh tries again */ }
+  }
+
+  function renderStats(st) {
+    const d = st.disk;
+    const box = $('stats-disk');
+    if (d) {
+      box.dataset.level = d.level;
+      $('stats-free').textContent = size(d.free);
+      const pct = (n) => (d.total ? (100 * n) / d.total : 0);
+      $('stats-pace').textContent = `${Math.round(pct(d.free))}% of ${size(d.total)}`
+        + (st.days_left == null ? '' : st.days_left > 365 ? ' · enough for more than a year at this pace'
+          : ` · full in about ${st.days_left < 1 ? 'less than a day' : `${Math.round(st.days_left)} days`} at this week's pace`);
+      const f = d.files || {};
+      const b = (k) => (f[k] ? f[k].bytes : 0);
+      $('sbar-jpg').style.width = `${pct(b('jpg'))}%`;
+      $('sbar-gif').style.width = `${pct(b('gif'))}%`;
+      $('sbar-mp4').style.width = `${pct(b('mp4'))}%`;
+      $('sbar-other').style.width = `${Math.max(0, pct(d.total - d.free - b('jpg') - b('gif') - b('mp4')))}%`;
+      const legend = $('stats-legend');
+      legend.replaceChildren();
+      for (const [cls, name, count, bytes] of [['k-jpg', 'Pictures', f.jpg && f.jpg.count, b('jpg')],
+        ['k-gif', 'GIFs', f.gif && f.gif.count, b('gif')], ['k-mp4', 'Videos', f.mp4 && f.mp4.count, b('mp4')],
+        ['k-other', 'System', null, Math.max(0, d.total - d.free - d.homesec)]]) {
+        const li = document.createElement('li');
+        const i = document.createElement('i');
+        i.className = cls;
+        const v = document.createElement('b');
+        v.textContent = count != null ? `${count} · ${size(bytes)}` : size(bytes);
+        li.append(i, `${name} `, v);
+        legend.append(li);
+      }
+    }
+    // space per day
+    const chart = $('chart');
+    const labels = $('chart-labels');
+    chart.replaceChildren();
+    labels.replaceChildren();
+    const totals = st.days.map((x) => x.jpg + x.gif + x.mp4);
+    const max = Math.max(1, ...totals);
+    const h = (n) => `${(n / max) * 86}%`;
+    st.days.forEach((x, i) => {
+      const col = document.createElement('div');
+      col.className = 'col';
+      const day = new Date(`${x.date}T12:00:00`);
+      col.title = `${x.date}: pictures ${size(x.jpg)}, GIFs ${size(x.gif)}, videos ${size(x.mp4)}`;
+      const total = document.createElement('span');
+      total.className = 'total';
+      total.textContent = totals[i] ? size(totals[i]) : '';
+      col.append(total);
+      for (const k of ['mp4', 'gif', 'jpg']) {
+        const s2 = document.createElement('span');
+        s2.className = `s-${k}`;
+        s2.style.height = h(x[k]);
+        col.append(s2);
+      }
+      chart.append(col);
+      const l = document.createElement('span');
+      l.textContent = i === 0 || day.getDate() === 1 ? `${day.getDate()} ${MONTHS[day.getMonth()]}` : String(day.getDate());
+      labels.append(l);
+    });
+    const best = totals.indexOf(Math.max(...totals));
+    $('chart-note').textContent = totals[best]
+      ? `Busiest day: ${dayName(st.days[best].date, dateText(serverNow()))}, ${size(totals[best])}. Older files are deleted automatically.`
+      : 'No files in the last 14 days.';
+    // clean-up
+    const list = $('cleanup');
+    list.replaceChildren();
+    const weekAgo = new Date(serverNow());
+    weekAgo.setDate(weekAgo.getDate() - 7);
+    const items = [
+      { title: 'Rejected pictures', detail: `${st.cleanup.rejected.count} pictures where nothing was recognised · ${size(st.cleanup.rejected.bytes)}`,
+        button: `Delete ${st.cleanup.rejected.count}`, off: !st.cleanup.rejected.count, body: 'action=rejected' },
+      { title: 'GIFs older than 2 days', detail: `the pictures and videos stay · ${st.cleanup.old_gifs.count} GIFs · ${size(st.cleanup.old_gifs.bytes)}`,
+        button: `Delete ${st.cleanup.old_gifs.count}`, off: !st.cleanup.old_gifs.count, body: 'action=old_gifs' },
+      { title: 'Everything before a date', detail: 'alerts, bird visits and rejected pictures', date: dateText(weekAgo),
+        button: 'Delete before', body: 'action=before' },
+    ];
+    for (const it of items) {
+      const li = document.createElement('li');
+      const text = document.createElement('div');
+      const t = document.createElement('b');
+      t.textContent = it.title;
+      const small = document.createElement('small');
+      small.textContent = it.detail;
+      text.append(t, small);
+      if (cleanupDone[it.body]) {
+        const done = document.createElement('span');
+        done.className = 'done';
+        done.textContent = cleanupDone[it.body];
+        text.append(done);
+      }
+      let input = null;
+      if (it.date) {
+        input = document.createElement('input');
+        input.type = 'date';
+        input.value = it.date;
+        input.max = dateText(serverNow());
+        input.setAttribute('aria-label', 'Delete everything before this date');
+        text.append(document.createElement('br'), input);
+      }
+      const b = document.createElement('button');
+      b.type = 'button';
+      b.className = 'tool danger';
+      b.textContent = it.button;
+      b.disabled = Boolean(it.off);
+      armable(b, 'Sure? Click again', async () => {
+        const body = input ? `${it.body}&before=${input.value}` : it.body;
+        const response = await fetch('/api/cleanup', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+          body,
+        });
+        if (!response.ok) throw new Error(String(response.status));
+        const gone = await response.json();
+        cleanupDone[it.body] = `✓ Deleted ${gone.files} file${gone.files === 1 ? '' : 's'} · ${size(gone.bytes)}`;
+        eventsKey = null;
+        visitsKey = null;
+        await loadStats();
+      });
+      li.append(text, b);
+      list.append(li);
+    }
+    // biggest videos: a click opens them in Files
+    const big = $('biggest');
+    big.replaceChildren();
+    if (!st.biggest.length) {
+      const li = document.createElement('li');
+      li.className = 'muted';
+      li.textContent = 'No videos yet.';
+      big.append(li);
+    }
+    for (const v of st.biggest) {
+      const li = document.createElement('li');
+      const a = document.createElement('a');
+      a.href = '#files';
+      a.addEventListener('click', () => { files.folder = 'all'; files.pick = v.id; files.sort = 'big'; $('files-sort').value = 'big'; });
+      const left = document.createElement('span');
+      left.textContent = `${v.label.charAt(0).toUpperCase()}${v.label.slice(1)} · ${dayName(v.date, dateText(serverNow()))} ${v.time.slice(0, 5)}`;
+      const right = document.createElement('span');
+      right.className = 'muted';
+      right.textContent = size(v.bytes);
+      a.append(left, right);
+      li.append(a);
+      big.append(li);
+    }
+    $('keep-note').textContent = `Kept automatically: alerts and rejected pictures ${st.keep.alerts} days, bird visits ${st.keep.visits} days `
+      + '(KEEP_DAYS and VISIT_KEEP_DAYS in /etc/homesec/homesec.env).';
+  }
+
+  // ---------- the tabs: #live, #files, #stats
+  const VIEWS = ['live', 'files', 'stats'];
+  function showView(name) {
+    view = VIEWS.includes(name) ? name : 'live';
+    for (const v of VIEWS) {
+      $(`view-${v}`).hidden = v !== view;
+      const tab = $(`nav-${v}`);
+      if (v === view) tab.setAttribute('aria-current', 'page'); else tab.removeAttribute('aria-current');
+    }
+    if (view === 'live') {
+      startStream();
+      requestAnimationFrame(() => { drawSpark(); updateArrows(); });
+    } else {
+      stopStream();      // the Pi makes live pictures only while someone watches
+      $('preview-video').pause();
+    }
+    if (view === 'files') loadFiles();
+    if (view === 'stats') loadStats();
+  }
+  window.addEventListener('hashchange', () => showView(location.hash.slice(1)));
+  showView(location.hash.slice(1));
+
   poll();
 })();

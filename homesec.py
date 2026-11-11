@@ -1573,6 +1573,10 @@ EVENT_NAME = re.compile(r"^\d{4}-\d{2}-\d{2}_\d{6}\.jpg$")
 MEDIA_NAME = re.compile(r"^\d{4}-\d{2}-\d{2}_\d{6}\.(jpg|gif|mp4)$")
 VISIT_NAME = re.compile(r"^\d{4}-\d{2}-\d{2}_\d{6}\.mp4$")
 VISIT_MEDIA = re.compile(r"^\d{4}-\d{2}-\d{2}_\d{6}\.(mp4|jpg)$")
+STEM = re.compile(r"^\d{4}-\d{2}-\d{2}_\d{6}$")
+STEM_FILE = re.compile(r"^(\d{4}-\d{2}-\d{2}_\d{6})\.(jpg|gif|mp4|json)$")
+FOLDERS = ("alerts", "visits", "rejected")  # alerts live in IMAGE_DIR itself
+FOLDER_URL = {"alerts": "/pictures/", "visits": "/videos/", "rejected": "/rejected/"}
 EVENT_FORMAT = "%Y-%m-%d_%H%M%S"
 
 
@@ -1821,6 +1825,154 @@ class App:
         names = self._visit_names()
         return names[0] if names else ""
 
+    # ---- the Files and Stats tabs
+    def folder_path(self, folder: str) -> Path:
+        return self.cfg.image_dir if folder == "alerts" else self.cfg.image_dir / folder
+
+    def keep_days(self, folder: str) -> int:
+        return self.cfg.visit_keep_days if folder == "visits" else self.cfg.keep_days
+
+    def catalog(self) -> list:
+        """Every saved event in every folder, with its files: what the Files and Stats tabs show.
+        One event = the files sharing a name (2026-11-11_014202 .jpg .gif .mp4 .json)."""
+        events = []
+        for folder in FOLDERS:
+            groups: dict = {}
+            try:
+                entries = list(os.scandir(self.folder_path(folder)))
+            except OSError:
+                continue
+            for entry in entries:
+                match = STEM_FILE.match(entry.name)
+                if not match or not entry.is_file(follow_symlinks=False):
+                    continue
+                try:
+                    size = entry.stat(follow_symlinks=False).st_size
+                except OSError:
+                    continue
+                groups.setdefault(match.group(1), []).append((entry.name, match.group(2), size))
+            for stem, files in groups.items():
+                stamp = _event_time(stem + ".jpg")
+                if stamp is None:
+                    continue
+                notes = {}
+                media = [f for f in files if f[1] != "json"]
+                if not media:
+                    continue
+                if any(f[1] == "json" for f in files):
+                    try:
+                        notes = json.loads((self.folder_path(folder) / f"{stem}.json").read_text())
+                    except (OSError, ValueError):
+                        notes = {}
+                order = {"mp4": 0, "jpg": 1, "gif": 2}
+                media.sort(key=lambda f: order[f[1]])
+                label = str(notes.get("label", "")) or {"visits": "visit", "rejected": "nothing"}.get(folder, "motion")
+                events.append({
+                    "id": f"{folder}/{stem}", "folder": folder, "stem": stem,
+                    "date": f"{stamp:%Y-%m-%d}", "time": f"{stamp:%H:%M:%S}", "ts": int(stamp.timestamp()),
+                    "label": label, "confidence": notes.get("confidence"), "seconds": notes.get("seconds"),
+                    "keep_until": f"{stamp + timedelta(days=self.keep_days(folder)):%Y-%m-%d}",
+                    "bytes": sum(f[2] for f in files),
+                    "files": [{"name": n, "kind": k, "bytes": b, "url": FOLDER_URL[folder] + n} for n, k, b in media],
+                })
+        events.sort(key=lambda e: e["ts"], reverse=True)
+        return events
+
+    def files(self) -> dict:
+        events = self.catalog()
+        folders = {f: {"events": 0, "bytes": 0} for f in FOLDERS}
+        for e in events:
+            folders[e["folder"]]["events"] += 1
+            folders[e["folder"]]["bytes"] += e["bytes"]
+        return {"folders": folders, "events": events, "path": str(self.cfg.image_dir)}
+
+    def delete_files(self, folder: str, stem: str) -> int:
+        """Delete every file of one event in a folder. Returns how many files went."""
+        if folder not in FOLDERS or not STEM.match(stem):
+            return 0
+        removed = 0
+        for suffix in ("jpg", "gif", "mp4", "json"):
+            path = self.folder_path(folder) / f"{stem}.{suffix}"
+            if path.is_file():
+                path.unlink()
+                removed += 1
+        self._names_at = float("-inf")
+        self._visit_names_at = float("-inf")
+        self.forget_disk()
+        return removed
+
+    def stats(self, days: int = 14) -> dict:
+        """Space per day and per kind, what the clean-up actions would remove, and the biggest files."""
+        events = self.catalog()
+        today = datetime.now().date()
+        per_day = {(today - timedelta(days=i)).isoformat(): {"jpg": 0, "gif": 0, "mp4": 0} for i in range(days)}
+        for e in events:
+            if e["date"] in per_day:
+                for f in e["files"]:
+                    per_day[e["date"]][f["kind"]] += f["bytes"]
+        cutoff = (today - timedelta(days=2)).isoformat()
+        rejected = [e for e in events if e["folder"] == "rejected"]
+        old_gifs = [f for e in events if e["folder"] == "alerts" and e["date"] < cutoff
+                    for f in e["files"] if f["kind"] == "gif"]
+        videos = sorted(((f, e) for e in events for f in e["files"] if f["kind"] == "mp4"),
+                        key=lambda fe: fe[0]["bytes"], reverse=True)
+        week = [per_day[d] for d in sorted(per_day)[-7:]]
+        per_week_day = sum(sum(d.values()) for d in week) / 7
+        disk = self.disk()
+        return {
+            "disk": disk,
+            "days": [{"date": d, **per_day[d]} for d in sorted(per_day)],
+            "days_left": round(disk["free"] / per_week_day, 1) if disk and per_week_day > 0 else None,
+            "keep": {"alerts": self.cfg.keep_days, "visits": self.cfg.visit_keep_days, "rejected": self.cfg.keep_days},
+            "cleanup": {
+                "rejected": {"count": len(rejected), "bytes": sum(e["bytes"] for e in rejected)},
+                "old_gifs": {"count": len(old_gifs), "bytes": sum(f["bytes"] for f in old_gifs), "before": cutoff},
+            },
+            "biggest": [{"id": e["id"], "name": f["name"], "bytes": f["bytes"], "date": e["date"], "time": e["time"],
+                         "label": e["label"], "url": f["url"]} for f, e in videos[:8]],
+            "totals": {"events": len(events), "people": sum(e["label"] == "person" for e in events),
+                       "visits": sum(e["folder"] == "visits" for e in events)},
+        }
+
+    def cleanup(self, action: str, before: str = "") -> dict:
+        """The Stats tab's clean-up buttons. Returns how many files and bytes went."""
+        events = self.catalog()
+        gone = {"files": 0, "bytes": 0}
+
+        def drop(folder: str, name: str, size: int) -> None:
+            try:
+                (self.folder_path(folder) / name).unlink()
+                gone["files"] += 1
+                gone["bytes"] += size
+            except FileNotFoundError:
+                pass
+
+        if action == "rejected":
+            for e in events:
+                if e["folder"] == "rejected":
+                    for f in e["files"]:
+                        drop("rejected", f["name"], f["bytes"])
+        elif action == "old_gifs":
+            cutoff = (datetime.now().date() - timedelta(days=2)).isoformat()
+            for e in events:
+                if e["folder"] == "alerts" and e["date"] < cutoff:
+                    for f in e["files"]:
+                        if f["kind"] == "gif":
+                            drop("alerts", f["name"], f["bytes"])
+        elif action == "before":
+            if not re.match(r"^\d{4}-\d{2}-\d{2}$", before):
+                raise ValueError("before must look like 2026-11-04")
+            for e in events:
+                if e["date"] < before:
+                    gone["files"] += self.delete_files(e["folder"], e["stem"])
+                    gone["bytes"] += e["bytes"]
+        else:
+            raise ValueError(f"unknown clean-up {action!r}")
+        self._names_at = float("-inf")
+        self._visit_names_at = float("-inf")
+        self.forget_disk()
+        return gone
+
     def events(self, limit: int = 60) -> list:
         events = []
         for name in self.names()[:limit]:
@@ -1910,6 +2062,16 @@ def make_handler(app: App):
                 return self._stream()
             if path == "/api/visits":
                 return self._json({"visits": app.visits()})
+            if path == "/api/files":
+                return self._json(app.files())
+            if path == "/api/stats":
+                return self._json(app.stats())
+            if path.startswith("/rejected/"):
+                name = path[len("/rejected/"):]
+                if not EVENT_NAME.match(name):
+                    return self._send(404, b"not found")
+                return self._file(cfg.image_dir / "rejected" / name, f"homesec_rejected_{name}",
+                                  "download" in parse_qs(url.query))
             if path.startswith("/videos/"):
                 return self._video(path[len("/videos/"):], "download" in parse_qs(url.query))
             if path.startswith("/pictures/"):
@@ -2033,11 +2195,37 @@ def make_handler(app: App):
             except ValueError:
                 length = -1
             path = urlparse(self.path).path
-            if path not in ("/api/detection", "/api/events/delete", "/api/visits/delete"):
+            if path not in ("/api/detection", "/api/events/delete", "/api/visits/delete", "/api/files/delete",
+                            "/api/cleanup"):
                 return self._send(404, b"not found")
             if not 0 <= length <= 100:
                 return self._send(400, b"bad request")
             form = parse_qs(self.rfile.read(length).decode("ascii", "replace"))
+            if path == "/api/files/delete":
+                folder, stem = form.get("folder", [""])[0], form.get("stem", [""])[0]
+                if folder not in FOLDERS or not STEM.match(stem):
+                    return self._send(400, b"bad request")
+                try:
+                    removed = app.delete_files(folder, stem)
+                except OSError as exc:
+                    log.error("could not delete %s/%s: %s", folder, stem, exc)
+                    return self._send(500, b"could not delete")
+                if not removed:
+                    return self._send(404, b"not found")
+                log.info("%s/%s deleted from the web page (%d files, %s)", folder, stem, removed, self.client_address[0])
+                return self._json({"deleted": f"{folder}/{stem}", "files": removed})
+            if path == "/api/cleanup":
+                action, before = form.get("action", [""])[0], form.get("before", [""])[0]
+                try:
+                    gone = app.cleanup(action, before)
+                except ValueError:
+                    return self._send(400, b"bad request")
+                except OSError as exc:
+                    log.error("clean-up %s failed: %s", action, exc)
+                    return self._send(500, b"clean-up failed")
+                log.info("clean-up %s%s from the web page: %d files, %.1f MB (%s)", action,
+                         f" {before}" if before else "", gone["files"], gone["bytes"] / 1e6, self.client_address[0])
+                return self._json(gone)
             if path == "/api/visits/delete":
                 name = form.get("name", [""])[0]
                 if not VISIT_NAME.match(name):
