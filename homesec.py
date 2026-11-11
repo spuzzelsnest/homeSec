@@ -1250,7 +1250,7 @@ def prune(image_dir: Path, keep_days: int) -> int:
     """Delete pictures older than keep_days so the SD card does not fill up."""
     cutoff = time.time() - keep_days * 86400
     removed = 0
-    for path in [*image_dir.glob("*.jpg"), *image_dir.glob("*.gif"), *image_dir.glob("*.mp4"),
+    for path in [*image_dir.glob("*.jpg"), *image_dir.glob("*.gif"), *image_dir.glob("*.mp4"), *image_dir.glob("*.json"),
                  *image_dir.glob("*.mp4.part"), *image_dir.glob("rejected/*.jpg")]:
         try:
             if path.stat().st_mtime < cutoff:
@@ -1428,8 +1428,24 @@ class Watcher:
         return path
 
     # ---- alerts
+    @staticmethod
+    def _notes(base: Path, **values) -> None:
+        """Small JSON notes next to an alert or visit (what was seen, how sure, video length), for the console."""
+        path = base.with_suffix(".json")
+        try:
+            notes = json.loads(path.read_text()) if path.exists() else {}
+        except (OSError, ValueError):
+            notes = {}
+        notes.update(values)
+        try:
+            path.write_text(json.dumps(notes))
+        except OSError as exc:
+            log.warning("could not save the notes %s: %s", path.name, exc)
+
     def _alert(self, t: float, event: Event) -> None:
         cfg = self.cfg
+        self._notes(event.path.with_suffix(""), label=event.label or "motion",
+                    confidence=round(event.confidence, 2), area=round(event.area, 1))
         self._last_trigger = t
         log.info("%s (%s), saved %s", event.headline().lower(), event.details(), event.path.name)
         filming = self.alert_videos and self._film_alert(t, event)
@@ -1503,16 +1519,13 @@ class Watcher:
                 log.warning("the alert video %s.mp4 came out empty", rec.base.name)
             else:
                 log.info("alert video saved: %s (about %d s, %.1f MB)", video.name, seconds, video.stat().st_size / 1e6)
+                self._notes(rec.base, seconds=seconds)
             return
         if video is None:
             log.warning("the visit video %s.mp4 came out empty", rec.base.name)
             rec.base.with_suffix(".jpg").unlink(missing_ok=True)
             return
-        try:
-            rec.base.with_suffix(".json").write_text(json.dumps(
-                {"label": rec.label, "confidence": round(rec.confidence, 2), "seconds": seconds}))
-        except OSError as exc:
-            log.warning("could not save the notes for %s: %s", video.name, exc)
+        self._notes(rec.base, label=rec.label, confidence=round(rec.confidence, 2), seconds=seconds)
         log.info("%s visit saved: %s (about %d s, %.1f MB)", rec.label, video.name, seconds, video.stat().st_size / 1e6)
 
     def flush(self) -> None:
@@ -1745,12 +1758,14 @@ class App:
                 continue
             stem = name[:-4]
             visit = {"name": name, "url": f"/videos/{name}", "date": f"{stamp:%Y-%m-%d}",
-                     "time": f"{stamp:%H:%M:%S}", "ts": int(stamp.timestamp()), "label": "", "seconds": None}
+                     "time": f"{stamp:%H:%M:%S}", "ts": int(stamp.timestamp()), "label": "", "seconds": None,
+                     "confidence": None}
             if (self.visit_dir / f"{stem}.jpg").is_file():
                 visit["thumb"] = f"/videos/{stem}.jpg"
             try:
                 notes = json.loads((self.visit_dir / f"{stem}.json").read_text())
                 visit["label"], visit["seconds"] = str(notes.get("label", "")), notes.get("seconds")
+                visit["confidence"] = notes.get("confidence")
             except (OSError, ValueError):
                 pass
             try:
@@ -1782,6 +1797,7 @@ class App:
         path.unlink()
         path.with_suffix(".gif").unlink(missing_ok=True)
         path.with_suffix(".mp4").unlink(missing_ok=True)
+        path.with_suffix(".json").unlink(missing_ok=True)
         self._names_at = float("-inf")  # rescan the folder on the next request
         self.forget_disk()
         return True
@@ -1805,10 +1821,17 @@ class App:
         names = self._visit_names()
         return names[0] if names else ""
 
-    def events(self, limit: int = 30) -> list:
+    def events(self, limit: int = 60) -> list:
         events = []
         for name in self.names()[:limit]:
             event = describe_event(name)
+            event.update(label="", confidence=None, seconds=None)
+            try:
+                notes = json.loads((self.cfg.image_dir / (name[:-4] + ".json")).read_text())
+                event.update(label=str(notes.get("label", "")), confidence=notes.get("confidence"),
+                             seconds=notes.get("seconds"))
+            except (OSError, ValueError):
+                pass
             clip = name[:-4] + ".gif"
             if (self.cfg.image_dir / clip).is_file():
                 event["clip"] = f"/pictures/{clip}"

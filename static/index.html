@@ -41,15 +41,16 @@
           <p id="overlay-text">Waiting for the camera…</p>
         </div>
         <span id="stamp" class="stamp" aria-hidden="true"></span>
+        <span id="rec-badge" class="rec-badge" hidden><span class="dot" aria-hidden="true"></span><span id="rec-text">REC</span></span>
         <span id="motion-badge" class="motion-badge" hidden>Motion</span>
+        <div class="stage-foot">
+          <span id="stream-info">—</span>
+          <span id="viewers"></span>
+        </div>
         <button id="fullscreen" class="icon-btn" type="button" aria-label="Full screen" title="Full screen">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5"/></svg>
         </button>
       </div>
-      <footer class="panel-foot">
-        <span id="stream-info">—</span>
-        <span id="viewers"></span>
-      </footer>
     </section>
 
     <aside class="side">
@@ -60,14 +61,15 @@
           <div class="meter-mark" title="Alert threshold"></div>
         </div>
         <p class="readout"><b id="score">0.0%</b> <span class="muted">/ alert at <span id="threshold">–</span></span></p>
-        <canvas id="spark" class="spark" width="320" height="64" aria-hidden="true"></canvas>
+        <canvas id="spark" class="spark" width="320" height="56" aria-hidden="true"></canvas>
       </section>
 
       <section class="panel">
         <h2>Activity</h2>
         <dl class="facts">
-          <div><dt>Events today</dt><dd id="events-today">0</dd></div>
-          <div><dt>Last motion</dt><dd id="last-motion">—</dd></div>
+          <div><dt>People today</dt><dd id="events-today">0</dd></div>
+          <div id="birds-today-row"><dt><span id="visit-what">Bird</span> visits today</dt><dd id="visits-today">0</dd></div>
+          <div><dt>Last alert</dt><dd id="last-motion">—</dd></div>
           <div><dt>Camera up</dt><dd id="uptime">—</dd></div>
           <div id="disk" class="disk">
             <dt>Disk free</dt><dd id="disk-free">—</dd>
@@ -84,23 +86,31 @@
         </dl>
       </section>
 
-      <section class="panel log">
-        <h2>Event log</h2>
-        <ol id="events" class="events" aria-live="polite">
-          <li class="empty">Waiting for events…</li>
-        </ol>
-      </section>
-
-      <section id="visits-panel" class="panel log" hidden>
-        <h2>Visits <span id="visits-what" class="muted"></span> <span id="visit-rec" class="rec" hidden>● recording</span></h2>
-        <ol id="visits" class="events" aria-live="polite">
-          <li class="empty">No visits yet…</li>
-        </ol>
-      </section>
-
       <p id="alerts" class="alerts muted"></p>
     </aside>
   </main>
+
+  <section class="panel film" aria-label="Past events">
+    <div class="film-head">
+      <div class="tabs" role="tablist" aria-label="Past events">
+        <button id="tab-people" class="tab" type="button" role="tab" aria-selected="true" aria-controls="strip">People <span id="count-people" class="count">0</span></button>
+        <button id="tab-birds" class="tab" type="button" role="tab" aria-selected="false" aria-controls="strip"><span id="tab-birds-label">Birds</span> <span id="count-birds" class="count">0</span></button>
+        <button id="tab-all" class="tab" type="button" role="tab" aria-selected="false" aria-controls="strip">All <span id="count-all" class="count">0</span></button>
+      </div>
+      <div class="film-nav">
+        <button id="latest" class="tool" type="button" title="Jump to the newest event">Now</button>
+        <button id="older" class="icon-btn nav" type="button" aria-label="Scroll to older events" title="Older">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M15 6l-6 6 6 6"/></svg>
+        </button>
+        <button id="newer" class="icon-btn nav" type="button" aria-label="Scroll to newer events" title="Newer">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 6l6 6-6 6"/></svg>
+        </button>
+      </div>
+    </div>
+    <ol id="strip" class="strip" role="tabpanel" aria-live="polite">
+      <li class="empty">Waiting for events…</li>
+    </ol>
+  </section>
 
   <dialog id="lightbox" aria-label="Captured picture">
     <form method="dialog">
