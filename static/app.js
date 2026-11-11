@@ -394,12 +394,10 @@
     const what = document.createElement('span');
     const label = item.label || (kind === 'visit' ? 'visit' : 'motion');
     what.className = `what ${label}`;
-    what.textContent = label;
+    what.textContent = [label, item.confidence != null ? `${Math.round(item.confidence * 100)}%` : ''].filter(Boolean).join(' ');
     line.append(time, what);
-    const sub = document.createElement('div');
-    sub.className = 'sub';
-    sub.textContent = sure(item.confidence) || (hasVideo ? 'video' : 'picture');
-    info.append(line, sub);
+    info.append(line);
+    open.title = [`${item.date} ${item.time}`, label, sure(item.confidence)].filter(Boolean).join(' · ');
     open.append(pic, info);
     open.addEventListener('click', () => (kind === 'visit' ? openVisit(item) : openPicture(item)));
 
@@ -590,7 +588,8 @@
     drawSpark();
 
     el.eventsToday.textContent = String(s.events_today);
-    el.lastMotion.textContent = s.last_motion ? `${s.last_motion.time} · ${ago(s.last_motion.ts)}` : '—';
+    el.lastMotion.textContent = s.last_motion ? ago(s.last_motion.ts) : '—';
+    el.lastMotion.title = s.last_motion ? `${s.last_motion.date} ${s.last_motion.time}` : '';
     el.uptime.textContent = duration(s.uptime);
     renderDisk(s.disk);
     el.streamInfo.textContent = `${s.resolution} · MJPEG · ${s.fps} fps`;

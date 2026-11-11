@@ -147,7 +147,8 @@ h2 {
   transition: border-color 0.2s;
 }
 .stage.alert { border-color: var(--danger); box-shadow: inset 0 0 40px rgba(240, 72, 90, 0.3); }
-.stage img { width: 100%; height: 100%; object-fit: contain; display: block; }
+/* the camera picture is pinned to the frame: it always fits whole, in its own shape (black bars where needed) */
+.stage img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; display: block; }
 .stage img:not([src]) { visibility: hidden; }
 .overlay {
   position: absolute;
@@ -284,12 +285,13 @@ h2 {
 .disk[data-level="low"] .diskbar { border-color: var(--danger); }
 
 /* ---- event slider ---- */
-.film { margin: var(--gap); padding: 12px 14px 14px; min-width: 0; }
-.film-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; margin-bottom: 10px; }
+/* compact, so the camera keeps at least 65% of the window height */
+.film { margin: 10px var(--gap) 12px; padding: 8px 12px 10px; min-width: 0; }
+.film-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; margin-bottom: 2px; }
 .tabs { display: flex; padding: 3px; border-radius: 999px; background: #0d151e; border: 1px solid var(--panel-edge); }
 .tab {
-  min-height: 36px;
-  padding: 0 16px;
+  min-height: 30px;
+  padding: 0 14px;
   border: 0;
   border-radius: 999px;
   background: transparent;
@@ -303,9 +305,9 @@ h2 {
 .tab[hidden] { display: none; }
 .count { opacity: 0.75; font-variant-numeric: tabular-nums; }
 .film-nav { display: flex; gap: 8px; align-items: center; }
-.film-nav .tool { min-height: 40px; padding: 0 14px; }
+.film-nav .tool { min-height: 34px; padding: 0 12px; }
 .film-nav .tool:disabled { opacity: 0.35; cursor: default; }
-.icon-btn.nav { width: 40px; height: 40px; background: #0d151e; border-color: var(--panel-edge); }
+.icon-btn.nav { width: 34px; height: 34px; background: #0d151e; border-color: var(--panel-edge); }
 .icon-btn.nav:disabled { opacity: 0.35; cursor: default; }
 .strip {
   list-style: none;
@@ -337,7 +339,7 @@ h2 {
   height: 2px;
   background: var(--panel-edge);
 }
-.card { flex: 0 0 13rem; padding-top: 30px; scroll-snap-align: start; }
+.card { flex: 0 0 11rem; padding-top: 26px; scroll-snap-align: start; }
 .card:hover .open, .card:focus-within .open { border-color: var(--accent); }
 .card .tick {
   position: absolute;
@@ -422,7 +424,7 @@ h2 {
   text-align: left;
   cursor: pointer;
 }
-.card .pic { position: relative; height: 7.3rem; background: #050a10; }
+.card .pic { position: relative; height: 4.3rem; background: #050a10; }
 .card .pic img { width: 100%; height: 100%; object-fit: cover; display: block; }
 .card .badge {
   position: absolute;
@@ -434,14 +436,16 @@ h2 {
   font-size: 0.7rem;
   font-weight: 650;
 }
-.card .info { padding: 7px 10px 9px; }
+.card .info { padding: 4px 8px 5px; }
 .card .line { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; }
 .card .line b { font-size: 0.9rem; font-variant-numeric: tabular-nums; }
 .card .what { font-size: 0.75rem; font-weight: 650; text-transform: capitalize; }
 .card .what.person { color: #fb7185; }
 .card .what.bird, .card .what.visit { color: #60a5fa; }
 .card .sub { font-size: 0.75rem; color: var(--muted); }
-.card .event-actions { position: absolute; top: 36px; right: 6px; opacity: 0.85; }
+.card .event-actions { position: absolute; top: 30px; right: 4px; gap: 3px; opacity: 0.85; }
+.card .icon-btn.small { min-width: 26px; height: 26px; padding: 0 4px; }
+.card .icon-btn.small svg { width: 14px; height: 14px; }
 .card:hover .event-actions, .card:focus-within .event-actions { opacity: 1; }
 .card .icon-btn.small { background: rgba(5, 10, 16, 0.78); }
 .rec { color: var(--danger); font-size: 0.7rem; letter-spacing: 0.05em; animation: pulse 2s ease-out infinite; }
@@ -503,10 +507,18 @@ dialog .close { position: absolute; top: 10px; right: 10px; }
 
 /* ---- small screens ---- */
 /* low screens: a smaller side panel, no motion graph */
+@media (max-height: 800px) and (min-width: 62.01rem) {
+  .bar { padding-top: 8px; padding-bottom: 8px; }
+  .layout { padding-top: 10px; }
+  .film { margin: 8px var(--gap) 8px; padding: 6px 10px 8px; }
+  .card .pic { height: 2.6rem; }
+  .card .badge { bottom: 4px; left: 4px; padding: 1px 5px; }
+  .card .event-actions { top: 29px; }
+  .card .icon-btn.small { min-width: 22px; height: 22px; }
+}
 @media (max-height: 760px) and (min-width: 62.01rem) {
   .spark { display: none; }
   .disk-kinds, .disk small { display: none; }
-  .card .pic { height: 5.6rem; }
 }
 /* phones and narrow windows: one column, the page scrolls normally */
 @media (max-width: 62rem) {
