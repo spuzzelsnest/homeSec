@@ -276,6 +276,9 @@ class Config:
     jpeg_quality: int
     web_host: str
     web_port: int
+    live_width: int
+    live_fps: float
+    live_quality: int
     web_url: str
     web_allowed_hosts: tuple
     static_dir: Path
@@ -397,6 +400,9 @@ class Config:
             jpeg_quality=r.number("JPEG_QUALITY", 90, int, 10, 100),
             web_host=r.text("WEB_HOST", "0.0.0.0"),
             web_port=r.number("WEB_PORT", 8080, int, 0, 65535),  # 0 = no web page
+            live_width=r.number("LIVE_WIDTH", 960, int, 160, 3840),      # the live view only; recordings keep RESOLUTION
+            live_fps=r.number("LIVE_FPS", 12.0, float, 1, 30),
+            live_quality=r.number("LIVE_QUALITY", 75, int, 10, 95),
             web_url=web_url,
             web_allowed_hosts=allowed_hosts,
             static_dir=static_dir,
@@ -694,6 +700,90 @@ def shrink_rgb(bgr: np.ndarray, width: int) -> np.ndarray:
     return np.ascontiguousarray(bgr[::step, ::step, 2::-1])
 
 
+def jpeg_encoder() -> Optional[Callable]:
+    """encode(bgr array, quality) -> JPEG bytes, with simplejpeg (comes with picamera2) or OpenCV."""
+    try:
+        import simplejpeg
+
+        return lambda bgr, q: simplejpeg.encode_jpeg(bgr, quality=q, colorspace="BGR", fastdct=True)
+    except ImportError:
+        pass
+    try:
+        import cv2
+
+        def encode(bgr, q):
+            ok, data = cv2.imencode(".jpg", bgr, [cv2.IMWRITE_JPEG_QUALITY, q])
+            if not ok:
+                raise RuntimeError("JPEG encoding failed")
+            return data.tobytes()
+        return encode
+    except ImportError:
+        return None
+
+
+class LiveFeed:
+    """Smooth live view, apart from detection: the camera hands over a small copy of every frame
+    (every n-th pixel of the main stream, so the recordings keep their full size), at most LIVE_FPS
+    a second and only while someone watches; this thread turns the newest one into a JPEG for the
+    page. Frames that arrive while it is still busy are skipped, never queued."""
+
+    def __init__(self, hub, width: int, fps: float, quality: int, encode: Callable):
+        self.hub = hub
+        self.width = width
+        self.interval = 1.0 / fps
+        self.quality = quality
+        self._encode = encode
+        self._cond = threading.Condition()
+        self._frame: Optional[np.ndarray] = None
+        self._next = 0.0
+        self._closed = False
+        self._failed = False
+        self.sent = 0
+        self.last_sent = 0.0     # time.monotonic() of the last picture
+        self._thread = threading.Thread(target=self._run, name="live", daemon=True)
+        self._thread.start()
+
+    def wants(self, now: float) -> bool:
+        """Cheap check for the camera thread: is a frame needed right now?"""
+        return self.hub.viewers > 0 and now >= self._next and not self._closed
+
+    def offer(self, bgr: np.ndarray, now: float) -> None:
+        """Called from the camera thread with the full-size picture (BGR); copies a small version."""
+        step = max(1, round(bgr.shape[1] / self.width))
+        small = np.ascontiguousarray(bgr[::step, ::step, :3])
+        # keep the pace steady; after a pause start again from now
+        self._next = self._next + self.interval if now - self._next < self.interval else now + self.interval
+        with self._cond:
+            self._frame = small
+            self._cond.notify()
+
+    def _run(self) -> None:
+        while True:
+            with self._cond:
+                self._cond.wait_for(lambda: self._frame is not None or self._closed)
+                if self._closed:
+                    return
+                frame, self._frame = self._frame, None
+            try:
+                self.hub.publish(self._encode(frame, self.quality))
+                self.sent += 1
+                self.last_sent = time.monotonic()
+                self._failed = False
+            except Exception as exc:  # the live view must never stop the alarm
+                if not self._failed:
+                    log.warning("live view picture failed: %s", exc)
+                    self._failed = True
+
+    def stalled(self, now: float, after: float = 3.0) -> bool:
+        """No picture for a while although someone watches: the caller falls back to the old way."""
+        return now - self.last_sent > after
+
+    def close(self) -> None:
+        with self._cond:
+            self._closed = True
+            self._cond.notify()
+
+
 class VideoBuffer:
     """The last few seconds of video, encoded in hardware (H.264) and kept in memory, so a recording
     can start before the moment something was seen. open() writes them, and what follows, to an MP4
@@ -791,8 +881,9 @@ class PiCamera:
                 lores={"size": cfg.detect_size, "format": "YUV420"},
                 # With visit videos the camera runs at up to VIDEO_FPS, but may slow down to FPS in the
                 # dark (longer exposure); detection still looks at FPS frames per second.
-                controls=({"FrameDurationLimits": (int(1e6 / max(cfg.video_fps, cfg.fps)), int(1e6 / cfg.fps))}
-                          if video else {"FrameRate": cfg.fps}),
+                # The live view gets its frames from the same stream, up to LIVE_FPS.
+                controls={"FrameDurationLimits": (int(1e6 / max(cfg.video_fps if video else 0, cfg.live_fps, cfg.fps)),
+                                                  int(1e6 / cfg.fps))},
                 # picamera2 default is 6; every buffer is a full picture in CMA memory. The video encoder
                 # holds one more.
                 buffer_count=cfg.buffer_count + (1 if video else 0),
@@ -848,7 +939,36 @@ class PiCamera:
         self._cam.capture_file(buffer, format="jpeg")
         return buffer.getvalue()
 
+    def attach_live(self, hub) -> Optional[LiveFeed]:
+        """Feed the live view from every camera frame (a picamera2 callback), instead of a separate
+        full-size capture per picture in the detection loop. None when no JPEG encoder is installed."""
+        encode = jpeg_encoder()
+        if encode is None:
+            return None
+        try:
+            from picamera2 import MappedArray
+        except ImportError:
+            return None
+        cfg = self._cfg
+        feed = LiveFeed(hub, cfg.live_width, cfg.live_fps, cfg.live_quality, encode)
+
+        def on_frame(request):
+            now = time.monotonic()
+            if not feed.wants(now):
+                return
+            try:
+                with MappedArray(request, "main") as m:
+                    feed.offer(m.array, now)
+            except Exception as exc:  # never disturb the camera
+                log.debug("live frame skipped: %s", exc)
+
+        self._cam.post_callback = on_frame
+        self.live = feed
+        return feed
+
     def close(self) -> None:
+        if getattr(self, "live", None) is not None:
+            self.live.close()
         try:
             if self.video is not None:
                 try:
@@ -3126,12 +3246,26 @@ def cmd_run(cfg: Config) -> int:
                  cfg.fps, cfg.min_area, cfg.cooldown, ", ".join(cfg.mail_to), " and posting to Slack" if slack else "")
         interval = 1.0 / cfg.fps
         view_failed = False
+        live = camera.attach_live(app.hub) if hasattr(camera, "attach_live") else None
+        live_fell_back = False
+        watched = False
+        if live is not None:
+            log.info("live view: %d px wide, up to %.0f fps (recordings stay %dx%d)", cfg.live_width, cfg.live_fps,
+                     *cfg.resolution)
         while not stop.is_set():
             began = time.monotonic()
             watcher.step()
             app.score = watcher.last_score
             app.visiting = watcher.visit.label if watcher.visit else ""
-            if app.hub.viewers:  # pictures for the live view are only made while someone is watching
+            if live is not None and app.hub.viewers and not watched:
+                live.last_sent = time.monotonic()  # someone started watching: give the feed 3 s
+            watched = app.hub.viewers > 0
+            fallback = live is not None and watched and live.stalled(time.monotonic())
+            if fallback and not live_fell_back:
+                log.warning("the live feed sends no pictures; using full-size captures for the live view")
+            live_fell_back = bool(fallback) or (live_fell_back and app.hub.viewers > 0)
+            # pictures for the live view are only made while someone is watching
+            if app.hub.viewers and (live is None or fallback):
                 try:
                     app.hub.publish(camera.jpeg())
                     view_failed = False

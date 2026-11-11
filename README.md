@@ -77,7 +77,7 @@ While the service runs, open `http://<name-or-ip-of-the-Pi>:8080/` (for example 
 
 The live picture is only sent while the Live tab is open. One button in the header pauses or resumes detection; while paused the camera is not watched and no alerts are sent, and the choice survives a restart. On a phone the tabs stack and scroll normally.
 
-Watching the live view makes detection slower while a page is open, more so at a high `RESOLUTION`; `1280x720` and `FPS=10` is a good choice.
+The live view has its own feed, apart from detection: the camera hands over a small copy of each frame (`LIVE_WIDTH`, 960 px; up to `LIVE_FPS`, 12 a second), which is turned into a JPEG in its own thread. Frames are skipped rather than queued, so the picture stays current, and detection runs at the same speed whether or not someone watches. The saved pictures and the videos keep the full `RESOLUTION`. On a slow network, lower `LIVE_WIDTH` (640) or `LIVE_QUALITY` (60).
 
 The console is behind a login and served over https (see Security). `WEB_HOST="127.0.0.1"` limits it to the Pi itself (for example through an SSH tunnel), `WEB_PORT=0` switches it off. Requests from other websites and unknown host names are refused (`WEB_ALLOWED_HOSTS` adds names).
 
