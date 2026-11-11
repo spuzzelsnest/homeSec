@@ -1787,6 +1787,43 @@ class Store:
                 "rejected": count(lambda r: r["folder"] == "rejected"),
                 "events": count(lambda r: True)}
 
+    GROUP = ("CASE WHEN e.folder = 'visits' THEN 'birds' WHEN e.folder = 'rejected' THEN 'rejected' "
+             "WHEN e.label = 'person' THEN 'people' ELSE 'other' END")
+    GROUPS = ("people", "birds", "other", "rejected")
+
+    def event_stats(self, days: int = 30) -> dict:
+        """Every event ever seen with the pictures, GIFs and videos it made, also the deleted ones."""
+        groups = {g: {"key": g, "events": 0, "kept": 0, "seconds": 0, "videos": 0, "confidence": None,
+                      "first": None, "last": None,
+                      "files": {k: {"made": 0, "kept": 0, "bytes": 0, "kept_bytes": 0} for k in ("jpg", "gif", "mp4")}}
+                  for g in self.GROUPS}
+        for r in self.rows(f"SELECT {self.GROUP} AS g, COUNT(*) AS n, SUM(e.deleted_at IS NULL) AS kept, "
+                           "SUM(COALESCE(e.seconds, 0)) AS secs, SUM(e.seconds IS NOT NULL) AS videos, "
+                           "AVG(e.confidence) AS conf, MIN(e.started_at) AS first, MAX(e.started_at) AS last "
+                           "FROM events e GROUP BY g"):
+            groups[r["g"]].update(events=r["n"], kept=r["kept"], seconds=r["secs"], videos=r["videos"],
+                                  confidence=round(r["conf"], 2) if r["conf"] is not None else None,
+                                  first=r["first"], last=r["last"])
+        for r in self.rows(f"SELECT {self.GROUP} AS g, f.kind, COUNT(*) AS made, SUM(f.deleted_at IS NULL) AS kept, "
+                           "SUM(f.bytes) AS bytes, SUM(CASE WHEN f.deleted_at IS NULL THEN f.bytes ELSE 0 END) AS kept_bytes "
+                           "FROM files f JOIN events e ON e.id = f.event_id GROUP BY g, f.kind"):
+            if r["kind"] in groups[r["g"]]["files"]:
+                groups[r["g"]]["files"][r["kind"]] = {k: r[k] for k in ("made", "kept", "bytes", "kept_bytes")}
+        today = datetime.now().date()
+        per_day = {(today - timedelta(days=i)).isoformat(): dict.fromkeys(self.GROUPS, 0) for i in range(days)}
+        for r in self.rows(f"SELECT substr(e.started_at, 1, 10) AS d, {self.GROUP} AS g, COUNT(*) AS n FROM events e "
+                           "WHERE e.started_at >= ? GROUP BY d, g", (min(per_day),)):
+            if r["d"] in per_day:
+                per_day[r["d"]][r["g"]] = r["n"]
+        per_hour = [dict.fromkeys(self.GROUPS, 0) for _ in range(24)]
+        for r in self.rows(f"SELECT CAST(substr(e.started_at, 12, 2) AS INTEGER) AS h, {self.GROUP} AS g, COUNT(*) AS n "
+                           "FROM events e GROUP BY h, g"):
+            if 0 <= r["h"] < 24:
+                per_hour[r["h"]][r["g"]] = r["n"]
+        return {"groups": [groups[g] for g in self.GROUPS],
+                "days": [{"date": d, **per_day[d]} for d in sorted(per_day)],
+                "hours": [{"hour": h, **c} for h, c in enumerate(per_hour)]}
+
     # ---- users and sessions
     def add_user(self, name: str, password: str, role: str = "admin") -> None:
         if not USER_NAME.match(name):
@@ -2298,6 +2335,7 @@ class App:
             "totals": {"events": len(events), "people": sum(e["label"] == "person" for e in events),
                        "visits": sum(e["folder"] == "visits" for e in events)},
             "history": self.store.history(),
+            "events": self.store.event_stats(),
         }
 
     def cleanup(self, action: str, before: str = "") -> dict:

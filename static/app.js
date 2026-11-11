@@ -827,6 +827,136 @@
     } catch (err) { /* the next refresh tries again */ }
   }
 
+  // events and their files, from the database
+  const GROUPS = [['people', 'People'], ['birds', 'Birds'], ['other', 'Other motion'], ['rejected', 'Rejected']];
+  const KINDS = [['jpg', 'Pictures'], ['gif', 'GIFs'], ['mp4', 'Videos']];
+  const plural = (n, word) => `${n} ${word}${n === 1 ? '' : 's'}`;
+  const videoTime = (s) => (s >= 3600 ? `${Math.floor(s / 3600)} h ${Math.round((s % 3600) / 60)} min`
+    : s >= 60 ? `${Math.floor(s / 60)} min ${s % 60} s` : `${s} s`);
+
+  function cell(made, kept, extra) {
+    const td = document.createElement('td');
+    if (!made) {
+      td.className = 'muted';
+      td.textContent = '–';
+      return td;
+    }
+    const b = document.createElement('b');
+    b.textContent = String(made);
+    td.append(b);
+    const small = document.createElement('small');
+    small.textContent = (kept === made ? 'all kept' : `${kept} kept`) + (extra ? ` · ${extra}` : '');
+    td.append(small);
+    return td;
+  }
+
+  function renderEventStats(ev) {
+    const table = $('ev-table');
+    table.replaceChildren();
+    const head = document.createElement('tr');
+    for (const t of ['', 'Events', ...KINDS.map((k) => k[1]), 'Video time']) {
+      const th = document.createElement('th');
+      th.textContent = t;
+      head.append(th);
+    }
+    table.append(head);
+    const total = { events: 0, kept: 0, seconds: 0, videos: 0, files: {} };
+    for (const [k] of KINDS) total.files[k] = { made: 0, kept: 0, bytes: 0, kept_bytes: 0 };
+    const byKey = Object.fromEntries(ev.groups.map((g) => [g.key, g]));
+    const row = (name, g, cls) => {
+      const tr = document.createElement('tr');
+      const th = document.createElement('td');
+      if (cls) {
+        const dot = document.createElement('i');
+        dot.className = `dot g-${cls}`;
+        th.append(dot);
+      }
+      th.append(name);
+      tr.append(th, cell(g.events, g.kept, ''));
+      for (const [k] of KINDS) {
+        const f = g.files[k];
+        tr.append(cell(f.made, f.kept, f.made ? size(f.bytes) : ''));
+      }
+      const td = document.createElement('td');
+      if (g.seconds) {
+        const b = document.createElement('b');
+        b.textContent = videoTime(g.seconds);
+        const small = document.createElement('small');
+        small.textContent = `avg ${videoTime(Math.round(g.seconds / Math.max(1, g.videos)))}`;
+        td.append(b, small);
+      } else {
+        td.className = 'muted';
+        td.textContent = '–';
+      }
+      tr.append(td);
+      return tr;
+    };
+    for (const [key, name] of GROUPS) {
+      const g = byKey[key];
+      if (!g) continue;
+      total.events += g.events;
+      total.kept += g.kept;
+      total.seconds += g.seconds;
+      total.videos += g.videos;
+      for (const [k] of KINDS) for (const f of ['made', 'kept', 'bytes', 'kept_bytes']) total.files[k][f] += g.files[k][f];
+      const tr = row(name, g, key);
+      if (g.events) {
+        const when = g.confidence != null && key !== 'rejected' ? ` · sure ${Math.round(g.confidence * 100)}% on average` : '';
+        tr.title = `${name}: first ${g.first}, last ${g.last}${when}`;
+      }
+      table.append(tr);
+    }
+    const tr = row('All', total, '');
+    tr.className = 'total';
+    table.append(tr);
+    const madeBytes = KINDS.reduce((n, [k]) => n + total.files[k].bytes, 0);
+    const keptBytes = KINDS.reduce((n, [k]) => n + total.files[k].kept_bytes, 0);
+    $('ev-note').textContent = total.events
+      ? `${plural(KINDS.reduce((n, [k]) => n + total.files[k].made, 0), 'file')} made, ${size(madeBytes)}; `
+        + `${size(keptBytes)} of it is still on disk (kept). The sizes are what was made. Hover a row for the first and last one.`
+      : 'No events yet.';
+
+    const bars = (box, labelBox, items, label, tip) => {
+      const el = $(box);
+      const labels = $(labelBox);
+      el.replaceChildren();
+      labels.replaceChildren();
+      const sums = items.map((x) => GROUPS.reduce((n, [g]) => n + x[g], 0));
+      const max = Math.max(1, ...sums);
+      items.forEach((x, i) => {
+        const col = document.createElement('div');
+        col.className = 'col';
+        col.title = `${tip(x)}: ${sums[i] ? GROUPS.filter(([g]) => x[g]).map(([g, n]) => `${x[g]} ${n.toLowerCase()}`).join(', ') : 'nothing'}`;
+        for (const [g] of GROUPS) {
+          if (!x[g]) continue;
+          const s2 = document.createElement('span');
+          s2.className = `g-${g}`;
+          s2.style.height = `${(x[g] / max) * 100}%`;
+          col.append(s2);
+        }
+        el.append(col);
+        const l = document.createElement('span');
+        l.textContent = label(x, i);
+        labels.append(l);
+      });
+    };
+    bars('ev-days', 'ev-days-labels', ev.days, (x, i) => {
+      const d = new Date(`${x.date}T12:00:00`);
+      return (ev.days.length - 1 - i) % 7 === 0 ? `${d.getDate()} ${MONTHS[d.getMonth()]}` : '';
+    }, (x) => x.date);
+    bars('ev-hours', 'ev-hours-labels', ev.hours, (x) => (x.hour % 6 === 0 ? `${String(x.hour).padStart(2, '0')}h` : ''),
+      (x) => `${String(x.hour).padStart(2, '0')}:00–${String(x.hour).padStart(2, '0')}:59`);
+    const legend = $('ev-legend');
+    legend.replaceChildren();
+    for (const [g, name] of GROUPS) {
+      const li = document.createElement('li');
+      const i = document.createElement('i');
+      i.className = `g-${g}`;
+      li.append(i, name);
+      legend.append(li);
+    }
+  }
+
   function renderStats(st) {
     const d = st.disk;
     const box = $('stats-disk');
@@ -861,6 +991,7 @@
     $('stats-history').textContent = hist && hist.since
       ? `Since ${dayName(hist.since, dateText(serverNow()))}: ${hist.people} people, ${hist.visits} bird visits, ${hist.events} events in all (kept in the database, also after the files are deleted)`
       : '';
+    if (st.events) renderEventStats(st.events);
     // space per day
     const chart = $('chart');
     const labels = $('chart-labels');

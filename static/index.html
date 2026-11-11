@@ -203,6 +203,26 @@
         <p id="keep-note" class="muted keep-note"></p>
       </section>
     </div>
+    <section class="panel events-panel">
+      <div class="ev-table-box">
+        <h2>Events and their files <span class="muted">· all time, also what was deleted</span></h2>
+        <table id="ev-table" class="ev-table"></table>
+        <p id="ev-note" class="muted ev-note"></p>
+      </div>
+      <div class="ev-charts">
+      <div class="ev-chart-box">
+        <h2>Events per day <span class="muted">· last 30 days</span></h2>
+        <div id="ev-days" class="minichart" role="img" aria-label="Events per day"></div>
+        <div id="ev-days-labels" class="minichart-labels" aria-hidden="true"></div>
+      </div>
+      <div class="ev-chart-box">
+        <h2>Time of day <span class="muted">· all time</span></h2>
+        <div id="ev-hours" class="minichart" role="img" aria-label="Events per hour of the day"></div>
+        <div id="ev-hours-labels" class="minichart-labels" aria-hidden="true"></div>
+        <ul id="ev-legend" class="stats-legend ev-legend"></ul>
+      </div>
+      </div>
+    </section>
   </div>
 
   <dialog id="lightbox" aria-label="Captured picture">
