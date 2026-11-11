@@ -79,7 +79,27 @@ The live picture is only sent while the Live tab is open. One button in the head
 
 Watching the live view makes detection slower while a page is open, more so at a high `RESOLUTION`; `1280x720` and `FPS=10` is a good choice.
 
-There is **no login**: anyone on your network who can reach the port sees the live camera and can pause the alarm. Use it on a trusted home network only, never forward the port to the internet. `WEB_HOST="127.0.0.1"` limits it to the Pi itself (for example through an SSH tunnel), `WEB_PORT=0` switches it off. Requests from other websites and unknown host names are refused (`WEB_ALLOWED_HOSTS` adds names).
+The console is behind a login and served over https (see Security). `WEB_HOST="127.0.0.1"` limits it to the Pi itself (for example through an SSH tunnel), `WEB_PORT=0` switches it off. Requests from other websites and unknown host names are refused (`WEB_ALLOWED_HOSTS` adds names).
+
+## Security: login, https, database
+
+**Login.** The web console needs a login. Make one on the Pi (`deploy.sh` asks for the first one):
+
+```
+sudo -u homesec homesec adduser jan              # asks for the password twice
+sudo -u homesec homesec adduser guest --role viewer   # can watch, not delete or pause detection
+sudo -u homesec homesec passwd jan               # new password; logs out all of jan's sessions
+sudo -u homesec homesec deluser guest
+sudo -u homesec homesec users
+```
+
+Passwords are stored as scrypt hashes, never as text. A login sets a session cookie (HttpOnly, SameSite=Strict, Secure over https); the session itself is stored hashed. "Keep me signed in" lasts 30 days (`SESSION_HOURS`), otherwise 12 hours. After 5 wrong tries within 15 minutes, the name and the address are locked for 15 minutes. Logins, failed logins, logouts, deletes, clean-ups and pausing are written to an audit log in the database (who, when, from where). `LOGIN=no` switches the login off: only on a network you fully trust.
+
+**https.** `deploy.sh` makes a self-signed certificate in `/etc/homesec/tls` (for `<hostname>`, `<hostname>.local` and the Pi's addresses, valid 825 days), and the console is served over https on the same port: `https://pycam.local:8080/`. Plain `http://` links get a redirect. A self-signed certificate is fine for a home/dev setup: the browser warns the first time ("not private"); check the address and accept it once per browser. To get rid of the warning, use a certificate your devices trust (for example made with `mkcert`, whose root you install on each device) and point `TLS_CERT` / `TLS_KEY` at it. A new certificate: delete `/etc/homesec/tls` and run `deploy.sh`.
+
+**Database.** `/var/lib/homesec/homesec.db` (SQLite) indexes every event and its files, and holds the logins, sessions and audit log. The pictures and videos stay files; the database follows the folders by itself (new alerts, finished videos, deletes, clean-up) and keeps the history of events whose files are long deleted (the Stats tab shows it). Existing pictures and videos are imported the first time. Make a backup with `sudo -u homesec sqlite3 /var/lib/homesec/homesec.db ".backup /tmp/homesec.db"` (needs `sqlite3`).
+
+Never forward the console's port on your router: for access from outside, use a VPN (for example Tailscale or WireGuard).
 
 ## Tuning
 

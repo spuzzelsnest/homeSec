@@ -38,6 +38,7 @@
 
   async function getJSON(url) {
     const response = await fetch(url, { cache: 'no-store' });
+    if (response.status === 401) window.location.href = '/login';  // the session ended
     if (!response.ok) throw new Error(`${url}: ${response.status}`);
     return response.json();
   }
@@ -565,6 +566,12 @@
     const paused = s.detection === 'paused';
 
     el.subtitle.textContent = [s.camera, s.resolution, s.host].filter(Boolean).join(' · ');
+    if (s.user) {
+      const logout = document.getElementById('logout');
+      logout.hidden = !s.user.login;
+      document.getElementById('user-name').textContent = s.user.name;
+      document.body.classList.toggle('viewer', s.user.role === 'viewer');
+    }
     el.detection.dataset.state = s.detection;
     el.detection.setAttribute('aria-pressed', String(!paused));
     el.detection.title = paused ? 'Click to resume motion detection' : 'Click to pause motion detection';
@@ -850,6 +857,10 @@
         legend.append(li);
       }
     }
+    const hist = st.history;
+    $('stats-history').textContent = hist && hist.since
+      ? `Since ${dayName(hist.since, dateText(serverNow()))}: ${hist.people} people, ${hist.visits} bird visits, ${hist.events} events in all (kept in the database, also after the files are deleted)`
+      : '';
     // space per day
     const chart = $('chart');
     const labels = $('chart-labels');

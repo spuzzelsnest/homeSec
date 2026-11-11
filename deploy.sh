@@ -40,7 +40,7 @@ if [[ $EUID -eq 0 ]]; then
 fi
 
 echo "== Installing packages =="
-packages=(python3-picamera2 python3-numpy python3-pil python3-av curl)
+packages=(python3-picamera2 python3-numpy python3-pil python3-av curl openssl)
 (( use_check )) && packages+=(python3-opencv)
 missing=()
 for pkg in "${packages[@]}"; do
@@ -115,6 +115,28 @@ else
     echo "Created $env_file: fill in your mail settings once (sudoedit $env_file); later runs keep them."
 fi
 
+echo "== https certificate =="
+# A self-signed certificate for the web console (a dev setup: browsers warn once, then you accept it).
+# Kept on later runs; delete /etc/homesec/tls to make a new one (e.g. after renaming the Pi).
+tls_dir=/etc/homesec/tls
+if sudo test -e "$tls_dir/cert.pem"; then
+    echo "Certificate already there ($tls_dir), keeping it."
+else
+    host=$(hostname)
+    san="DNS:$host,DNS:$host.local,DNS:localhost,IP:127.0.0.1"
+    for ip in $(hostname -I 2>/dev/null); do
+        [[ $ip == *:* ]] || san="$san,IP:$ip"
+    done
+    sudo install -d -m 0750 -o root -g "$service_user" "$tls_dir"
+    sudo openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -days 825 \
+        -subj "/CN=$host.local/O=homeSec" -addext "subjectAltName=$san" \
+        -keyout "$tls_dir/key.pem" -out "$tls_dir/cert.pem" 2>/dev/null
+    sudo chown root:"$service_user" "$tls_dir/key.pem" "$tls_dir/cert.pem"
+    sudo chmod 0640 "$tls_dir/key.pem"
+    sudo chmod 0644 "$tls_dir/cert.pem"
+    echo "Created a self-signed certificate for $host.local ($san), valid 825 days."
+fi
+
 echo "== Installing service =="
 sudo install -m 0644 "$SCRIPT_DIR/homesec.service" /etc/systemd/system/homesec.service
 sudo systemctl daemon-reload
@@ -161,6 +183,20 @@ if placeholders || ! sudo grep -qE '^SMTP_HOST=.+' "$env_file"; then
         echo "Still not filled in. Edit it (sudoedit $env_file) and run ./deploy.sh again."
         old_software_note
         exit 1
+    fi
+fi
+
+# ---- the first login ----------------------------------------------------------------------
+if sudo -u "$service_user" homesec users 2>/dev/null | grep -q '^no logins yet'; then
+    echo
+    echo "The web console needs a login, and there is none yet."
+    if [[ -t 0 ]]; then
+        read -r -p "Name for the first login (letters, digits, . _ -): " first_user
+        if [[ -n ${first_user:-} ]]; then
+            sudo -u "$service_user" homesec adduser "$first_user" || echo "Not created; later: sudo -u $service_user homesec adduser NAME"
+        fi
+    else
+        echo "Create one with: sudo -u $service_user homesec adduser NAME"
     fi
 fi
 
@@ -220,6 +256,19 @@ sudo systemctl restart homesec.service
 sleep 8
 if systemctl is-active --quiet homesec.service; then
     report "service" ok "running"
+    port=$(sudo grep -E '^WEB_PORT=' "$env_file" | tail -1 | cut -d= -f2 | tr -d \"\' || true)
+    port=${port:-8080}
+    if [[ $port != 0 ]]; then
+        scheme=http
+        sudo test -e "$tls_dir/cert.pem" && scheme=https
+        code=$(curl -sk -o /dev/null -w '%{http_code}' "$scheme://127.0.0.1:$port/login" || true)
+        if [[ $code == 200 ]]; then
+            users=$(sudo -u "$service_user" homesec users 2>/dev/null | grep -vc '^no logins yet' || true)
+            report "web console" ok "$scheme://$(hostname).local:$port/ (login page answers; $users login(s))"
+        else
+            report "web console" FAIL "$scheme://127.0.0.1:$port/login answered ${code:-nothing}"
+        fi
+    fi
 else
     report "service" FAIL "not running, see: journalctl -u homesec -e"
 fi
@@ -234,7 +283,8 @@ echo
 if (( failed )); then
     echo "Something failed (see above). Fix it and run ./deploy.sh again."
 else
-    echo "All good. Watch it live with: journalctl -u homesec -f   (web console: http://$(hostname).local:8080/)"
+    echo "All good. Watch it live with: journalctl -u homesec -f"
+    echo "Web console: ${scheme:-https}://$(hostname).local:${port:-8080}/  (self-signed certificate: accept the browser's warning once)"
 fi
 old_software_note
 exit "$failed"

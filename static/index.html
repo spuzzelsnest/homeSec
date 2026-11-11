@@ -35,6 +35,10 @@
       <span id="live" class="pill" data-state="connecting" role="status">
         <span class="dot" aria-hidden="true"></span><span id="live-label">Connecting</span>
       </span>
+      <form id="logout" class="logout" method="post" action="/api/logout" hidden>
+        <span id="user-name" class="muted"></span>
+        <button class="pill" type="submit" title="Log out">Log out</button>
+      </form>
     </div>
   </header>
 
@@ -175,6 +179,7 @@
         <h2>Disk free</h2>
         <p id="stats-free" class="big">—</p>
         <p id="stats-pace" class="muted"></p>
+        <p id="stats-history" class="muted history"></p>
       </div>
       <div>
         <div class="stats-bar" role="img" aria-label="Disk use">

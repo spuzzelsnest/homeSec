@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <meta name="robots" content="noindex">
+  <title>homeSec · Log in</title>
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body class="login-page">
+  <main class="login-box">
+    <div class="login-brand">
+      <svg class="logo" viewBox="0 0 32 32" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <rect x="2.5" y="8" width="18" height="16" rx="3.5"/>
+        <circle cx="11.5" cy="16" r="4.2"/>
+        <circle cx="11.5" cy="16" r="1.3" fill="currentColor" stroke="none"/>
+        <path d="M20.5 14.2 29 10v12l-8.5-4.2z"/>
+      </svg>
+      <h1>homeSec Console</h1>
+    </div>
+    <!--message-->
+    <form class="login-form" method="post" action="/api/login">
+      <input type="hidden" name="next" value="__NEXT__">
+      <label for="name">Name</label>
+      <input id="name" name="name" type="text" autocomplete="username" autocapitalize="none" spellcheck="false" required autofocus>
+      <label for="password">Password</label>
+      <input id="password" name="password" type="password" autocomplete="current-password" required>
+      <label class="remember"><input type="checkbox" name="remember" checked> Keep me signed in on this device</label>
+      <button class="login-button" type="submit">Log in</button>
+    </form>
+    <p class="muted login-foot">After 5 wrong tries the login is locked for 15 minutes.</p>
+  </main>
+</body>
+</html>

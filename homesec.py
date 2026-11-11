@@ -3,6 +3,9 @@
 
 Commands:
   homesec run          watch the camera and mail a picture on movement (the service)
+  homesec adduser NAME add a login for the web console (asks for the password; --role viewer: watch only)
+  homesec passwd NAME  change a password      homesec deluser NAME  remove a login
+  homesec users        list the logins
   homesec snapshot     take one picture now and mail it (stop the service first)
   homesec mailtest     send a test mail without using the camera
   homesec slacktest    post a test message to Slack
@@ -19,6 +22,11 @@ deploy.sh downloads (YOLOX-tiny, Apache-2.0 licence).
 from __future__ import annotations
 
 import argparse
+import base64
+import getpass
+import hashlib
+import hmac
+import secrets
 import errno
 import io
 import ipaddress
@@ -33,6 +41,7 @@ import shutil
 import signal
 import smtplib
 import socket
+import sqlite3
 import ssl
 import sys
 import threading
@@ -40,6 +49,7 @@ import time
 import urllib.error
 import urllib.request
 from collections import deque
+from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
 from email.message import EmailMessage
@@ -253,6 +263,12 @@ class Config:
     video_kbps: int
     visit_keep_days: int
     alert_video: bool
+    db_file: Path
+    login: bool
+    session_hours: int
+    tls: str
+    tls_cert: Path
+    tls_key: Path
     warmup: float
     cooldown: float
     keep_days: int
@@ -367,6 +383,12 @@ class Config:
             video_kbps=r.number("VIDEO_KBPS", 8000, int, 500, 25000),
             visit_keep_days=r.number("VISIT_KEEP_DAYS", 30, int, 1, 3650),
             alert_video=r.flag("ALERT_VIDEO", True),
+            db_file=Path(r.text("DB_FILE")) if r.text("DB_FILE") else Path(r.text("IMAGE_DIR", "/var/lib/homesec")) / "homesec.db",
+            login=r.flag("LOGIN", True),
+            session_hours=r.number("SESSION_HOURS", 720, int, 1, 8760),  # 30 days with "keep me signed in"
+            tls=r.choice("TLS", "auto", ("auto", "on", "off")),
+            tls_cert=Path(r.text("TLS_CERT", "/etc/homesec/tls/cert.pem")),
+            tls_key=Path(r.text("TLS_KEY", "/etc/homesec/tls/key.pem")),
             warmup=r.number("WARMUP", 5.0, float, 0, 600),
             cooldown=r.number("COOLDOWN", 300.0, float, 1, 86400),
             keep_days=r.number("KEEP_DAYS", 7, int, 1, 3650),
@@ -496,9 +518,16 @@ class Event:
         return ", ".join(parts)
 
 
+def web_scheme(cfg: Config) -> str:
+    """https when the certificate is there (TLS=auto) or TLS=on."""
+    if cfg.tls == "on" or (cfg.tls == "auto" and cfg.tls_cert.is_file()):
+        return "https"
+    return "http"
+
+
 def console_link(cfg: Config, path: str = "/") -> str:
     host = socket.gethostname()
-    return (cfg.web_url or f"http://{host}.local:{cfg.web_port}") + path
+    return (cfg.web_url or f"{web_scheme(cfg)}://{host}.local:{cfg.web_port}") + path
 
 
 def event_body(event: Event, clip: Optional[Path] = None, cfg: Optional[Config] = None) -> str:
@@ -617,7 +646,7 @@ def slack_text(cfg: Config, event: Event, video: bool = False) -> str:
     text = (f":rotating_light: *{event.headline()}* on `{host}` at {event.when:%Y-%m-%d %H:%M:%S} "
             f"({event.details()})")
     if cfg.web_port:
-        base = cfg.web_url or f"http://{host}.local:{cfg.web_port}"
+        base = cfg.web_url or f"{web_scheme(cfg)}://{host}.local:{cfg.web_port}"
         links = [f"<{base}/pictures/{event.path.name}|View picture>"]
         if video:  # ready when the movement has stopped
             links.append(f"<{base}/pictures/{event.path.stem}.mp4|View video>")
@@ -1438,7 +1467,9 @@ class Watcher:
             notes = {}
         notes.update(values)
         try:
-            path.write_text(json.dumps(notes))
+            tmp = path.with_name(path.name + ".tmp")
+            tmp.write_text(json.dumps(notes))
+            tmp.replace(path)  # a rename changes the folder's mtime: the database notices
         except OSError as exc:
             log.warning("could not save the notes %s: %s", path.name, exc)
 
@@ -1548,6 +1579,288 @@ class Watcher:
             log.warning("could not move or remove %s: %s", path.name, exc)
 
 
+# --------------------------------------------------------------------------- database
+
+
+USER_NAME = re.compile(r"^[A-Za-z0-9._-]{1,32}$")
+SCRYPT = (2 ** 14, 8, 1)  # n, r, p: about 16 MB and 0.1 s per check on a Pi 4
+
+
+def hash_password(password: str) -> str:
+    """scrypt with a random salt, stored as scrypt$n$r$p$salt$hash; never the password itself."""
+    n, r, p = SCRYPT
+    salt = secrets.token_bytes(16)
+    digest = hashlib.scrypt(password.encode(), salt=salt, n=n, r=r, p=p, dklen=32)
+    return "$".join(["scrypt", str(n), str(r), str(p), base64.b64encode(salt).decode(), base64.b64encode(digest).decode()])
+
+
+def verify_password(password: str, stored: str) -> bool:
+    try:
+        kind, n, r, p, salt, digest = stored.split("$")
+        if kind != "scrypt":
+            return False
+        check = hashlib.scrypt(password.encode(), salt=base64.b64decode(salt), n=int(n), r=int(r), p=int(p),
+                               dklen=len(base64.b64decode(digest)))
+    except (ValueError, TypeError):
+        return False
+    return hmac.compare_digest(check, base64.b64decode(digest))
+
+
+def token_hash(token: str) -> str:
+    """Sessions are stored hashed: a stolen database does not give working cookies."""
+    return hashlib.sha256(token.encode()).hexdigest()
+
+
+class Store:
+    """The SQLite database (one file, IMAGE_DIR/homesec.db): the index of all events and their files, plus
+    users, sessions and an audit log. The pictures and videos stay files on disk; the database follows
+    the disk (sync) and keeps the history of events whose files are long gone.
+
+    One connection, shared by the web threads and the detection loop behind a lock; WAL mode, so reads
+    do not wait for writes."""
+
+    VERSION = 1
+    SCHEMA = (
+        """CREATE TABLE events (
+             id INTEGER PRIMARY KEY,
+             folder TEXT NOT NULL,              -- alerts, visits, rejected
+             stem TEXT NOT NULL,                -- 2026-11-11_014202
+             label TEXT NOT NULL DEFAULT '',    -- person, bird, motion, ...
+             confidence REAL,
+             area REAL,
+             seconds INTEGER,                   -- video length
+             started_at TEXT NOT NULL,          -- local time, 2026-11-11 01:42:02
+             created_at TEXT NOT NULL,
+             deleted_at TEXT,                   -- set when all its files are gone; the row stays as history
+             UNIQUE (folder, stem))""",
+        "CREATE INDEX events_started ON events (started_at)",
+        """CREATE TABLE files (
+             id INTEGER PRIMARY KEY,
+             event_id INTEGER NOT NULL REFERENCES events (id) ON DELETE CASCADE,
+             name TEXT NOT NULL,
+             kind TEXT NOT NULL,                -- jpg, gif, mp4
+             bytes INTEGER NOT NULL,
+             created_at TEXT NOT NULL,
+             deleted_at TEXT,
+             UNIQUE (event_id, name))""",
+        """CREATE TABLE users (
+             id INTEGER PRIMARY KEY,
+             name TEXT NOT NULL UNIQUE COLLATE NOCASE,
+             password TEXT NOT NULL,            -- scrypt hash, never the password
+             role TEXT NOT NULL DEFAULT 'admin',
+             created_at TEXT NOT NULL,
+             last_login TEXT)""",
+        """CREATE TABLE sessions (
+             token TEXT PRIMARY KEY,            -- sha256 of the cookie value
+             user_id INTEGER NOT NULL REFERENCES users (id) ON DELETE CASCADE,
+             created_at TEXT NOT NULL,
+             expires_at TEXT NOT NULL,
+             last_seen TEXT NOT NULL,
+             ip TEXT,
+             agent TEXT)""",
+        """CREATE TABLE audit (
+             id INTEGER PRIMARY KEY,
+             at TEXT NOT NULL,
+             user TEXT,
+             ip TEXT,
+             action TEXT NOT NULL,              -- login, login_failed, logout, delete, cleanup, detection, ...
+             detail TEXT)""",
+    )
+
+    def __init__(self, path: Path):
+        self.path = path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        self._lock = threading.RLock()
+        self._db = sqlite3.connect(str(path), check_same_thread=False, isolation_level=None, timeout=10)
+        self._db.row_factory = sqlite3.Row
+        self._db.execute("PRAGMA journal_mode=WAL")
+        self._db.execute("PRAGMA foreign_keys=ON")
+        self._migrate()
+        try:
+            os.chmod(path, 0o600)  # password hashes and sessions: for the service user only
+        except OSError:
+            pass
+
+    @staticmethod
+    def now() -> str:
+        return f"{datetime.now():%Y-%m-%d %H:%M:%S}"
+
+    def _migrate(self) -> None:
+        version = self._db.execute("PRAGMA user_version").fetchone()[0]
+        if version > self.VERSION:
+            raise ConfigError(f"{self.path} is from a newer homeSec (database version {version}); update homeSec")
+        if version < 1:
+            with self.tx() as db:
+                for statement in self.SCHEMA:
+                    db.execute(statement)
+                db.execute(f"PRAGMA user_version={self.VERSION}")
+            log.info("database created: %s", self.path)
+
+    @contextmanager
+    def tx(self):
+        """A transaction: everything inside is saved together, or not at all."""
+        with self._lock:
+            self._db.execute("BEGIN IMMEDIATE")
+            try:
+                yield self._db
+            except BaseException:
+                self._db.execute("ROLLBACK")
+                raise
+            self._db.execute("COMMIT")
+
+    def rows(self, sql: str, args: tuple = ()) -> list:
+        with self._lock:
+            return [dict(r) for r in self._db.execute(sql, args).fetchall()]
+
+    def close(self) -> None:
+        with self._lock:
+            self._db.close()
+
+    # ---- events and files
+    def sync(self, scanned: list, folders: tuple = ()) -> tuple:
+        """Make the database match the disk. `scanned` is what scan_disk() found (in `folders`, or all).
+        New events and files are added, changed ones updated, missing ones marked deleted.
+        Returns (events added, events marked deleted)."""
+        now = self.now()
+        added = gone = 0
+        with self.tx() as db:
+            seen = set()
+            for e in scanned:
+                seen.add((e["folder"], e["stem"]))
+                row = db.execute("SELECT id, deleted_at FROM events WHERE folder = ? AND stem = ?",
+                                 (e["folder"], e["stem"])).fetchone()
+                if row is None:
+                    cur = db.execute(
+                        "INSERT INTO events (folder, stem, label, confidence, area, seconds, started_at, created_at) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                        (e["folder"], e["stem"], e["label"], e["confidence"], e.get("area"), e["seconds"],
+                         f"{e['date']} {e['time']}", now))
+                    event_id = cur.lastrowid
+                    added += 1
+                else:
+                    event_id = row["id"]
+                    db.execute("UPDATE events SET label = ?, confidence = ?, area = COALESCE(?, area), seconds = ?, "
+                               "deleted_at = NULL WHERE id = ?",
+                               (e["label"], e["confidence"], e.get("area"), e["seconds"], event_id))
+                names = []
+                for f in e["files"]:
+                    names.append(f["name"])
+                    db.execute("INSERT INTO files (event_id, name, kind, bytes, created_at) VALUES (?, ?, ?, ?, ?) "
+                               "ON CONFLICT (event_id, name) DO UPDATE SET bytes = excluded.bytes, deleted_at = NULL",
+                               (event_id, f["name"], f["kind"], f["bytes"], now))
+                marks = ",".join("?" * len(names))
+                db.execute(f"UPDATE files SET deleted_at = ? WHERE event_id = ? AND deleted_at IS NULL "
+                           f"AND name NOT IN ({marks})", (now, event_id, *names))
+            where = f"AND folder IN ({','.join('?' * len(folders))})" if folders else ""
+            for row in db.execute(f"SELECT id, folder, stem FROM events WHERE deleted_at IS NULL {where}",
+                                  tuple(folders)).fetchall():
+                if (row["folder"], row["stem"]) not in seen:
+                    db.execute("UPDATE events SET deleted_at = ? WHERE id = ?", (now, row["id"]))
+                    db.execute("UPDATE files SET deleted_at = ? WHERE event_id = ? AND deleted_at IS NULL",
+                               (now, row["id"]))
+                    gone += 1
+        return added, gone
+
+    def catalog(self) -> list:
+        """The events whose files are still there, newest first, with their files."""
+        events = self.rows("SELECT * FROM events WHERE deleted_at IS NULL ORDER BY started_at DESC, id DESC")
+        files: dict = {}
+        for f in self.rows("SELECT event_id, name, kind, bytes FROM files WHERE deleted_at IS NULL"):
+            files.setdefault(f["event_id"], []).append(f)
+        out = []
+        order = {"mp4": 0, "jpg": 1, "gif": 2}
+        for e in events:
+            fs = sorted(files.get(e["id"], []), key=lambda f: order.get(f["kind"], 9))
+            if not fs:
+                continue
+            out.append({**e, "files": fs})
+        return out
+
+    def history(self) -> dict:
+        """All events ever seen, also those whose files were deleted: the database's memory."""
+        rows = self.rows("SELECT folder, label, COUNT(*) AS n, MIN(started_at) AS first FROM events GROUP BY folder, label")
+        first = min((r["first"] for r in rows), default=None)
+        count = lambda pred: sum(r["n"] for r in rows if pred(r))  # noqa: E731
+        return {"since": first[:10] if first else None,
+                "people": count(lambda r: r["label"] == "person"),
+                "visits": count(lambda r: r["folder"] == "visits"),
+                "rejected": count(lambda r: r["folder"] == "rejected"),
+                "events": count(lambda r: True)}
+
+    # ---- users and sessions
+    def add_user(self, name: str, password: str, role: str = "admin") -> None:
+        if not USER_NAME.match(name):
+            raise ConfigError("a user name is 1-32 letters, digits, dots, dashes or underscores")
+        if role not in ("admin", "viewer"):
+            raise ConfigError("role must be admin or viewer")
+        try:
+            with self.tx() as db:
+                db.execute("INSERT INTO users (name, password, role, created_at) VALUES (?, ?, ?, ?)",
+                           (name, hash_password(password), role, self.now()))
+        except sqlite3.IntegrityError:
+            raise ConfigError(f"user {name} already exists (homesec passwd {name} changes the password)") from None
+
+    def set_password(self, name: str, password: str) -> bool:
+        with self.tx() as db:
+            cur = db.execute("UPDATE users SET password = ? WHERE name = ?", (hash_password(password), name))
+            if cur.rowcount:  # a new password logs out every session of that user
+                db.execute("DELETE FROM sessions WHERE user_id = (SELECT id FROM users WHERE name = ?)", (name,))
+            return bool(cur.rowcount)
+
+    def delete_user(self, name: str) -> bool:
+        with self.tx() as db:
+            return bool(db.execute("DELETE FROM users WHERE name = ?", (name,)).rowcount)
+
+    def users(self) -> list:
+        return self.rows("SELECT id, name, role, created_at, last_login FROM users ORDER BY name")
+
+    def check_password(self, name: str, password: str) -> Optional[dict]:
+        rows = self.rows("SELECT * FROM users WHERE name = ?", (name,))
+        if not rows:
+            hash_password(password)  # same work as for a real user: the answer time does not tell who exists
+            return None
+        return rows[0] if verify_password(password, rows[0]["password"]) else None
+
+    def new_session(self, user_id: int, hours: int, ip: str = "", agent: str = "") -> str:
+        token = secrets.token_urlsafe(32)
+        now = datetime.now()
+        with self.tx() as db:
+            db.execute("DELETE FROM sessions WHERE expires_at < ?", (f"{now:%Y-%m-%d %H:%M:%S}",))
+            db.execute("INSERT INTO sessions (token, user_id, created_at, expires_at, last_seen, ip, agent) "
+                       "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                       (token_hash(token), user_id, f"{now:%Y-%m-%d %H:%M:%S}",
+                        f"{now + timedelta(hours=hours):%Y-%m-%d %H:%M:%S}", f"{now:%Y-%m-%d %H:%M:%S}",
+                        ip or None, (agent or "")[:200] or None))
+            db.execute("UPDATE users SET last_login = ? WHERE id = ?", (f"{now:%Y-%m-%d %H:%M:%S}", user_id))
+        return token
+
+    def session_user(self, token: str) -> Optional[dict]:
+        """The user of a session cookie, or None when it is unknown or expired."""
+        if not token or len(token) > 100:
+            return None
+        rows = self.rows("SELECT u.id, u.name, u.role, s.expires_at, s.last_seen FROM sessions s "
+                         "JOIN users u ON u.id = s.user_id WHERE s.token = ?", (token_hash(token),))
+        if not rows or rows[0]["expires_at"] < self.now():
+            return None
+        if rows[0]["last_seen"][:16] != self.now()[:16]:  # at most one write a minute per session
+            with self.tx() as db:
+                db.execute("UPDATE sessions SET last_seen = ? WHERE token = ?", (self.now(), token_hash(token)))
+        return rows[0]
+
+    def end_session(self, token: str) -> None:
+        with self.tx() as db:
+            db.execute("DELETE FROM sessions WHERE token = ?", (token_hash(token),))
+
+    # ---- audit
+    def audit(self, action: str, user: str = "", ip: str = "", detail: str = "") -> None:
+        try:
+            with self.tx() as db:
+                db.execute("INSERT INTO audit (at, user, ip, action, detail) VALUES (?, ?, ?, ?, ?)",
+                           (self.now(), user or None, ip or None, action, detail or None))
+        except sqlite3.Error as exc:  # the audit log must never break what it records
+            log.warning("could not write the audit log: %s", exc)
+
+
 # ------------------------------------------------------------------------ web console
 
 
@@ -1650,8 +1963,13 @@ class App:
     """What the web console can see and change."""
 
     def __init__(self, cfg: Config, control: Control, backend: str = "", names_ttl: float = 2.0,
-                 objects: tuple = ()):
+                 objects: tuple = (), store: Optional[Store] = None):
         self.cfg = cfg
+        self.store = store or Store(cfg.db_file)
+        self._failures: dict = {}        # ip or user name -> times of failed logins (lockout)
+        self._dir_marks: dict = {}       # folder -> mtime of the folder at the last sync
+        self._sync_lock = threading.Lock()
+        self._catalog: Optional[list] = None
         self.control = control
         self.backend = backend
         self.objects = objects  # what the object check looks for; empty when it is off
@@ -1673,8 +1991,9 @@ class App:
 
     def status(self) -> dict:
         cfg = self.cfg
-        names = self.names()
         today = f"{datetime.now():%Y-%m-%d}"
+        alerts = [e for e in self.catalog() if e["folder"] == "alerts"]
+        last = alerts[0] if alerts else None
         return {
             "detection": "paused" if self.control.paused else "on",
             "score": round(self.score, 2),
@@ -1682,8 +2001,9 @@ class App:
             "check": {"enabled": bool(self.objects), "objects": list(self.objects)},
             "visits": {"enabled": bool(self.record), "objects": list(self.record), "recording": self.visiting,
                        "today": self._visits_today(), "last": self._last_visit()},
-            "events_today": sum(n.startswith(today) for n in names),
-            "last_motion": describe_event(names[0]) if names else None,
+            "events_today": sum(e["date"] == today for e in alerts),
+            "last_motion": ({"name": f"{last['stem']}.jpg", "url": f"/pictures/{last['stem']}.jpg", "date": last["date"],
+                             "time": last["time"], "ts": last["ts"]} if last else None),
             "camera": self.backend,
             "resolution": f"{cfg.resolution[0]}x{cfg.resolution[1]}",
             "fps": cfg.fps,
@@ -1751,32 +2071,22 @@ class App:
         return self.cfg.image_dir / "visits"
 
     def visits(self, limit: int = 60) -> list:
-        try:
-            names = sorted((p.name for p in self.visit_dir.iterdir() if VISIT_NAME.match(p.name)), reverse=True)
-        except OSError:
-            return []
+        """The visit videos for the timeline, newest first."""
         visits = []
-        for name in names[:limit]:
-            stamp = _event_time(name)
-            if stamp is None:
+        for e in self.catalog():
+            if e["folder"] != "visits":
                 continue
-            stem = name[:-4]
-            visit = {"name": name, "url": f"/videos/{name}", "date": f"{stamp:%Y-%m-%d}",
-                     "time": f"{stamp:%H:%M:%S}", "ts": int(stamp.timestamp()), "label": "", "seconds": None,
-                     "confidence": None}
-            if (self.visit_dir / f"{stem}.jpg").is_file():
-                visit["thumb"] = f"/videos/{stem}.jpg"
-            try:
-                notes = json.loads((self.visit_dir / f"{stem}.json").read_text())
-                visit["label"], visit["seconds"] = str(notes.get("label", "")), notes.get("seconds")
-                visit["confidence"] = notes.get("confidence")
-            except (OSError, ValueError):
-                pass
-            try:
-                visit["mb"] = round((self.visit_dir / name).stat().st_size / 1e6, 1)
-            except OSError:
+            kinds = {f["kind"]: f for f in e["files"]}
+            if "mp4" not in kinds:
                 continue
+            visit = {"name": kinds["mp4"]["name"], "url": kinds["mp4"]["url"], "date": e["date"], "time": e["time"],
+                     "ts": e["ts"], "label": "" if e["label"] == "visit" else e["label"], "seconds": e["seconds"],
+                     "confidence": e["confidence"], "mb": round(kinds["mp4"]["bytes"] / 1e6, 1)}
+            if "jpg" in kinds:
+                visit["thumb"] = kinds["jpg"]["url"]
             visits.append(visit)
+            if len(visits) >= limit:
+                break
         return visits
 
     def delete_visit(self, name: str) -> bool:
@@ -1789,6 +2099,7 @@ class App:
         for suffix in (".jpg", ".json"):
             path.with_suffix(suffix).unlink(missing_ok=True)
         self.forget_disk()
+        self.ensure_synced(force=True)
         return True
 
     def delete_event(self, name: str) -> bool:
@@ -1802,28 +2113,16 @@ class App:
         path.with_suffix(".gif").unlink(missing_ok=True)
         path.with_suffix(".mp4").unlink(missing_ok=True)
         path.with_suffix(".json").unlink(missing_ok=True)
-        self._names_at = float("-inf")  # rescan the folder on the next request
         self.forget_disk()
+        self.ensure_synced(force=True)
         return True
-
-    def _visit_names(self) -> list:
-        now = time.monotonic()
-        if now - getattr(self, "_visit_names_at", float("-inf")) >= self._names_ttl:
-            try:
-                self._visit_name_cache = sorted((p.name for p in self.visit_dir.iterdir() if VISIT_NAME.match(p.name)),
-                                                reverse=True)
-            except OSError:
-                self._visit_name_cache = []
-            self._visit_names_at = now
-        return self._visit_name_cache
 
     def _visits_today(self) -> int:
         today = f"{datetime.now():%Y-%m-%d}"
-        return sum(n.startswith(today) for n in self._visit_names())
+        return sum(e["folder"] == "visits" and e["date"] == today for e in self.catalog())
 
     def _last_visit(self) -> str:
-        names = self._visit_names()
-        return names[0] if names else ""
+        return next((f"{e['stem']}.mp4" for e in self.catalog() if e["folder"] == "visits"), "")
 
     # ---- the Files and Stats tabs
     def folder_path(self, folder: str) -> Path:
@@ -1832,11 +2131,78 @@ class App:
     def keep_days(self, folder: str) -> int:
         return self.cfg.visit_keep_days if folder == "visits" else self.cfg.keep_days
 
+    # ---- login
+    LOCK_AFTER = 5          # failed logins ...
+    LOCK_WINDOW = 15 * 60   # ... within this many seconds lock the ip address and the user name this long
+
+    def locked_for(self, *keys: str) -> int:
+        """Seconds until a login from this ip / for this name may be tried again (0 = now)."""
+        now = time.monotonic()
+        wait = 0
+        for key in keys:
+            recent = [t for t in self._failures.get(key, []) if now - t < self.LOCK_WINDOW]
+            self._failures[key] = recent
+            if len(recent) >= self.LOCK_AFTER:
+                wait = max(wait, int(self.LOCK_WINDOW - (now - recent[-self.LOCK_AFTER])) + 1)
+        return wait
+
+    def login_failed(self, *keys: str) -> None:
+        now = time.monotonic()
+        for key in keys:
+            self._failures.setdefault(key, []).append(now)
+
+    def login_ok(self, *keys: str) -> None:
+        for key in keys:
+            self._failures.pop(key, None)
+
+    def ensure_synced(self, force: bool = False) -> None:
+        """Bring the database up to date with the folders that changed since the last look. A folder's
+        mtime changes whenever a file in it is created, renamed or deleted (homeSec writes its notes by
+        renaming too), so this catches new alerts, finished videos, GIFs, prune and deletes."""
+        with self._sync_lock:
+            changed = []
+            for folder in FOLDERS:
+                try:
+                    mark = self.folder_path(folder).stat().st_mtime_ns
+                except OSError:
+                    mark = None
+                if force or self._dir_marks.get(folder, -1) != mark:
+                    changed.append((folder, mark))
+            if not changed:
+                return
+            folders = tuple(f for f, _ in changed)
+            added, gone = self.store.sync(self.scan_disk(folders), folders)
+            if added or gone:
+                log.debug("database synced: %d new, %d gone (%s)", added, gone, ", ".join(folders))
+            for folder, mark in changed:
+                self._dir_marks[folder] = mark
+            self._catalog = None
+
     def catalog(self) -> list:
-        """Every saved event in every folder, with its files: what the Files and Stats tabs show.
+        """Every saved event, with its files, from the database: what the timeline, Files and Stats show."""
+        self.ensure_synced()
+        if self._catalog is None:
+            events = []
+            for e in self.store.catalog():
+                stamp = datetime.strptime(e["started_at"], "%Y-%m-%d %H:%M:%S")
+                folder = e["folder"]
+                events.append({
+                    "id": f"{folder}/{e['stem']}", "folder": folder, "stem": e["stem"],
+                    "date": f"{stamp:%Y-%m-%d}", "time": f"{stamp:%H:%M:%S}", "ts": int(stamp.timestamp()),
+                    "label": e["label"], "confidence": e["confidence"], "seconds": e["seconds"],
+                    "keep_until": f"{stamp + timedelta(days=self.keep_days(folder)):%Y-%m-%d}",
+                    "bytes": sum(f["bytes"] for f in e["files"]),
+                    "files": [{"name": f["name"], "kind": f["kind"], "bytes": f["bytes"],
+                               "url": FOLDER_URL[folder] + f["name"]} for f in e["files"]],
+                })
+            self._catalog = events
+        return self._catalog
+
+    def scan_disk(self, folders: tuple = FOLDERS) -> list:
+        """Every saved event in the folders on disk, with its files and notes, for the database.
         One event = the files sharing a name (2026-11-11_014202 .jpg .gif .mp4 .json)."""
         events = []
-        for folder in FOLDERS:
+        for folder in folders:
             groups: dict = {}
             try:
                 entries = list(os.scandir(self.folder_path(folder)))
@@ -1871,7 +2237,7 @@ class App:
                     "id": f"{folder}/{stem}", "folder": folder, "stem": stem,
                     "date": f"{stamp:%Y-%m-%d}", "time": f"{stamp:%H:%M:%S}", "ts": int(stamp.timestamp()),
                     "label": label, "confidence": notes.get("confidence"), "seconds": notes.get("seconds"),
-                    "keep_until": f"{stamp + timedelta(days=self.keep_days(folder)):%Y-%m-%d}",
+                    "area": notes.get("area"),
                     "bytes": sum(f[2] for f in files),
                     "files": [{"name": n, "kind": k, "bytes": b, "url": FOLDER_URL[folder] + n} for n, k, b in media],
                 })
@@ -1896,9 +2262,8 @@ class App:
             if path.is_file():
                 path.unlink()
                 removed += 1
-        self._names_at = float("-inf")
-        self._visit_names_at = float("-inf")
         self.forget_disk()
+        self.ensure_synced(force=True)
         return removed
 
     def stats(self, days: int = 14) -> dict:
@@ -1932,6 +2297,7 @@ class App:
                          "label": e["label"], "url": f["url"]} for f, e in videos[:8]],
             "totals": {"events": len(events), "people": sum(e["label"] == "person" for e in events),
                        "visits": sum(e["folder"] == "visits" for e in events)},
+            "history": self.store.history(),
         }
 
     def cleanup(self, action: str, before: str = "") -> dict:
@@ -1968,29 +2334,29 @@ class App:
                     gone["bytes"] += e["bytes"]
         else:
             raise ValueError(f"unknown clean-up {action!r}")
-        self._names_at = float("-inf")
-        self._visit_names_at = float("-inf")
         self.forget_disk()
+        self.ensure_synced(force=True)
         return gone
 
     def events(self, limit: int = 60) -> list:
+        """The alerts for the timeline, newest first."""
         events = []
-        for name in self.names()[:limit]:
-            event = describe_event(name)
-            event.update(label="", confidence=None, seconds=None)
-            try:
-                notes = json.loads((self.cfg.image_dir / (name[:-4] + ".json")).read_text())
-                event.update(label=str(notes.get("label", "")), confidence=notes.get("confidence"),
-                             seconds=notes.get("seconds"))
-            except (OSError, ValueError):
-                pass
-            clip = name[:-4] + ".gif"
-            if (self.cfg.image_dir / clip).is_file():
-                event["clip"] = f"/pictures/{clip}"
-            video = name[:-4] + ".mp4"
-            if (self.cfg.image_dir / video).is_file():
-                event["video"] = f"/pictures/{video}"
+        for e in self.catalog():
+            if e["folder"] != "alerts":
+                continue
+            kinds = {f["kind"]: f for f in e["files"]}
+            if "jpg" not in kinds:
+                continue
+            event = {"name": kinds["jpg"]["name"], "url": kinds["jpg"]["url"], "date": e["date"], "time": e["time"],
+                     "ts": e["ts"], "label": "" if e["label"] == "motion" else e["label"],
+                     "confidence": e["confidence"], "seconds": e["seconds"]}
+            if "gif" in kinds:
+                event["clip"] = kinds["gif"]["url"]
+            if "mp4" in kinds:
+                event["video"] = kinds["mp4"]["url"]
             events.append(event)
+            if len(events) >= limit:
+                break
         return events
 
 
@@ -2021,11 +2387,92 @@ def make_handler(app: App):
                                    "connect-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'",
         "X-Content-Type-Options": "nosniff",
         "X-Frame-Options": "DENY",
-        "Referrer-Policy": "no-referrer",
+        "Referrer-Policy": "same-origin",  # no-referrer makes Chrome send "Origin: null" on form posts
     }
+
+    login_page = cfg.static_dir / "login.html"
+    public = {"/login", "/style.css", "/favicon.svg", "/login.css"}
 
     class Handler(BaseHTTPRequestHandler):
         timeout = 30  # seconds: a stalled or half-open connection must not hold a thread for ever
+        user: Optional[dict] = None
+
+        @property
+        def secure(self) -> bool:
+            return isinstance(self.connection, ssl.SSLSocket)
+
+        def _ip(self) -> str:
+            return self.client_address[0]
+
+        def _audit(self, action: str, detail: str = "", user: str = "") -> None:
+            app.store.audit(action, user or (self.user or {}).get("name", ""), self._ip(), detail)
+
+        def _redirect(self, where: str, cookie: str = "") -> None:
+            self.send_response(303)
+            self.send_header("Location", where)
+            self.send_header("Content-Length", "0")
+            self.send_header("Cache-Control", "no-store")
+            if cookie:
+                self.send_header("Set-Cookie", cookie)
+            for key, value in security.items():
+                self.send_header(key, value)
+            self.end_headers()
+
+        def _https_only(self) -> bool:
+            """With https on, a plain http request gets a redirect (GET) or is refused."""
+            if not getattr(self.server, "tls", None) or self.secure:
+                return True
+            if self.command == "GET":
+                self.send_response(301)
+                self.send_header("Location", f"https://{self.headers.get('Host', '')}{self.path}")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+            else:
+                self._send(403, b"use https")
+            return False
+
+        def _cookie(self, name: str) -> str:
+            for part in self.headers.get("Cookie", "").split(";"):
+                key, _, value = part.strip().partition("=")
+                if key == name:
+                    return value
+            return ""
+
+        def _session_cookie(self, token: str, max_age: Optional[int]) -> str:
+            parts = [f"homesec={token}", "Path=/", "HttpOnly", "SameSite=Strict"]
+            if self.secure:
+                parts.append("Secure")
+            if max_age is not None:
+                parts.append(f"Max-Age={max_age}")
+            return "; ".join(parts)
+
+        def _signed_in(self) -> bool:
+            """Sets self.user. Without LOGIN everyone is an admin."""
+            if not cfg.login:
+                self.user = {"name": "", "role": "admin"}
+                return True
+            self.user = app.store.session_user(self._cookie("homesec"))
+            return self.user is not None
+
+        def _login_page(self, message: str = "") -> None:
+            try:
+                page = login_page.read_text(encoding="utf-8")
+            except OSError:
+                return self._send(500, b"login page not found")
+            if not app.store.users():
+                message = message or ("There are no logins yet. On the Pi, create one with: "
+                                      "sudo -u homesec homesec adduser YOURNAME")
+            note = f'<p class="login-msg" role="alert">{html_escape(message)}</p>' if message else ""
+            nxt = parse_qs(urlparse(self.path).query).get("next", ["/"])[0]
+            page = page.replace("<!--message-->", note).replace("__NEXT__", html_escape(safe_next(nxt)))
+            self._send(200, page.encode(), "text/html; charset=utf-8")
+
+        def _need_login(self, path: str) -> None:
+            if path in ("/", "/index.html"):
+                return self._redirect("/login")
+            if path.startswith(("/pictures/", "/videos/", "/rejected/")):
+                return self._redirect(f"/login?next={path}")
+            self._send(401, b"please log in", extra={"WWW-Authenticate": 'FormBased realm="homeSec"'})
 
         def _send(self, code: int, body: bytes = b"", ctype: str = "text/plain; charset=utf-8",
                   cache: str = "no-store", extra: Optional[dict] = None) -> None:
@@ -2050,12 +2497,23 @@ def make_handler(app: App):
             return False
 
         def do_GET(self):
-            if not self._host_ok():
+            if not self._host_ok() or not self._https_only():
                 return
             url = urlparse(self.path)
             path = url.path
+            if path in public:
+                if path == "/login":
+                    if self._signed_in() and cfg.login:
+                        return self._redirect("/")
+                    return self._login_page({"wrong": "Wrong name or password.", "locked": "Too many tries. Wait a few minutes.",
+                                             "out": "You are logged out."}.get(parse_qs(url.query).get("e", [""])[0], ""))
+                return self._static(path.lstrip("/"))
+            if not self._signed_in():
+                return self._need_login(path)
             if path == "/api/status":
-                return self._json(app.status())
+                status = app.status()
+                status["user"] = {"name": self.user["name"], "role": self.user["role"], "login": cfg.login}
+                return self._json(status)
             if path == "/api/events":
                 return self._json({"events": app.events()})
             if path == "/stream.mjpg":
@@ -2184,23 +2642,41 @@ def make_handler(app: App):
             finally:
                 hub.remove_viewer()
 
+        def _same_site(self) -> bool:
+            site = self.headers.get("Sec-Fetch-Site")
+            if site:
+                return site in ("same-origin", "none")
+            origin = self.headers.get("Origin")
+            return not origin or (origin != "null" and urlparse(origin).netloc == self.headers.get("Host"))
+
         def do_POST(self):
-            if not self._host_ok():
+            if not self._host_ok() or not self._https_only():
                 return
-            origin = self.headers.get("Origin")  # a page on another site must not flip the switch
-            if origin and urlparse(origin).netloc != self.headers.get("Host"):
+            if not self._same_site():  # a page on another site must not log in, delete or flip the switch
                 return self._send(403, b"forbidden")
             try:
                 length = int(self.headers.get("Content-Length", "0"))
             except ValueError:
                 length = -1
             path = urlparse(self.path).path
+            if path == "/api/login":
+                return self._login(length)
             if path not in ("/api/detection", "/api/events/delete", "/api/visits/delete", "/api/files/delete",
-                            "/api/cleanup"):
+                            "/api/cleanup", "/api/logout"):
                 return self._send(404, b"not found")
             if not 0 <= length <= 100:
                 return self._send(400, b"bad request")
             form = parse_qs(self.rfile.read(length).decode("ascii", "replace"))
+            if not self._signed_in():
+                return self._send(401, b"please log in")
+            if path == "/api/logout":
+                token = self._cookie("homesec")
+                if token:
+                    app.store.end_session(token)
+                self._audit("logout")
+                return self._redirect("/login?e=out", self._session_cookie("", 0))
+            if self.user["role"] != "admin":
+                return self._send(403, b"this login can only watch")
             if path == "/api/files/delete":
                 folder, stem = form.get("folder", [""])[0], form.get("stem", [""])[0]
                 if folder not in FOLDERS or not STEM.match(stem):
@@ -2213,6 +2689,7 @@ def make_handler(app: App):
                 if not removed:
                     return self._send(404, b"not found")
                 log.info("%s/%s deleted from the web page (%d files, %s)", folder, stem, removed, self.client_address[0])
+                self._audit("delete", f"{folder}/{stem}")
                 return self._json({"deleted": f"{folder}/{stem}", "files": removed})
             if path == "/api/cleanup":
                 action, before = form.get("action", [""])[0], form.get("before", [""])[0]
@@ -2225,6 +2702,7 @@ def make_handler(app: App):
                     return self._send(500, b"clean-up failed")
                 log.info("clean-up %s%s from the web page: %d files, %.1f MB (%s)", action,
                          f" {before}" if before else "", gone["files"], gone["bytes"] / 1e6, self.client_address[0])
+                self._audit("cleanup", f"{action} {before}".strip() + f": {gone['files']} files")
                 return self._json(gone)
             if path == "/api/visits/delete":
                 name = form.get("name", [""])[0]
@@ -2236,8 +2714,8 @@ def make_handler(app: App):
                 except OSError as exc:
                     log.error("could not delete %s: %s", name, exc)
                     return self._send(500, b"could not delete the video")
-                app._visit_names_at = float("-inf")
                 log.info("visit video %s deleted from the web page (%s)", name, self.client_address[0])
+                self._audit("delete", f"visits/{name}")
                 return self._json({"deleted": name, "visits": app.visits()})
             if path == "/api/events/delete":
                 name = form.get("name", [""])[0]
@@ -2250,13 +2728,43 @@ def make_handler(app: App):
                     log.error("could not delete %s: %s", name, exc)
                     return self._send(500, b"could not delete the picture")
                 log.info("picture %s deleted from the web page (%s)", name, self.client_address[0])
+                self._audit("delete", f"alerts/{name}")
                 return self._json({"deleted": name, "events": app.events()})
             state = form.get("state", [""])[0]
             if state not in ("on", "off"):
                 return self._send(400, b"bad request")
             app.control.set_paused(state == "off")
             log.info("detection switched %s from the web page (%s)", state, self.client_address[0])
-            self._json(app.status())
+            self._audit("detection", state)
+            status = app.status()
+            status["user"] = {"name": self.user["name"], "role": self.user["role"], "login": cfg.login}
+            self._json(status)
+
+        def _login(self, length: int) -> None:
+            if not 0 <= length <= 600:
+                return self._send(400, b"bad request")
+            form = parse_qs(self.rfile.read(length).decode("utf-8", "replace"))
+            name = form.get("name", [""])[0].strip()[:64]
+            password = form.get("password", [""])[0][:200]
+            nxt = safe_next(form.get("next", ["/"])[0])
+            keys = (f"ip:{self._ip()}", f"user:{name.lower()}")
+            if app.locked_for(*keys):
+                self._audit("login_locked", user=name)
+                return self._redirect("/login?e=locked")
+            user = app.store.check_password(name, password) if name and password else None
+            if user is None:
+                app.login_failed(*keys)
+                self._audit("login_failed", user=name)
+                log.warning("failed login for %r from %s", name, self._ip())
+                return self._redirect("/login?e=wrong")
+            app.login_ok(*keys)
+            remember = form.get("remember", [""])[0] == "on"
+            hours = cfg.session_hours if remember else 12
+            token = app.store.new_session(user["id"], hours, self._ip(), self.headers.get("User-Agent", ""))
+            self.user = user
+            self._audit("login")
+            log.info("%s logged in from %s", user["name"], self._ip())
+            self._redirect(nxt, self._session_cookie(token, hours * 3600 if remember else None))
 
         def log_message(self, fmt, *args):
             log.debug("web: " + fmt, *args)
@@ -2264,18 +2772,81 @@ def make_handler(app: App):
     return Handler
 
 
+def html_escape(text: str) -> str:
+    return (text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+            .replace('"', "&quot;").replace("'", "&#39;"))
+
+
+def safe_next(target: str) -> str:
+    """Where to go after the login: only a path on this site, never another site."""
+    return target if target.startswith("/") and not target.startswith("//") and "\\" not in target else "/"
+
+
+def tls_context(cfg: Config) -> Optional[ssl.SSLContext]:
+    """The certificate for https, or None for plain http (TLS=off, or auto without a certificate)."""
+    if cfg.tls == "off" or (cfg.tls == "auto" and not cfg.tls_cert.is_file()):
+        return None
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    context.minimum_version = ssl.TLSVersion.TLSv1_2
+    try:
+        context.load_cert_chain(str(cfg.tls_cert), str(cfg.tls_key))
+    except (OSError, ssl.SSLError) as exc:
+        raise ConfigError(f"cannot load the https certificate {cfg.tls_cert} / {cfg.tls_key}: {exc}; "
+                          "run ./deploy.sh, which makes one, or set TLS=off") from None
+    return context
+
+
+class WebServer(ThreadingHTTPServer):
+    """https and plain http on the same port: a connection that starts with a TLS handshake is encrypted,
+    any other gets a redirect to https. So old http:// links and bookmarks keep working."""
+
+    daemon_threads = True
+
+    def __init__(self, address, handler, tls: Optional[ssl.SSLContext] = None):
+        super().__init__(address, handler)
+        self.tls = tls
+
+    def finish_request(self, request, client_address):
+        if self.tls is None:
+            return super().finish_request(request, client_address)
+        request.settimeout(10)
+        try:
+            first = request.recv(1, socket.MSG_PEEK)
+        except OSError:
+            return
+        if first == b"\x16":  # a TLS handshake
+            try:
+                request = self.tls.wrap_socket(request, server_side=True)
+            except (ssl.SSLError, OSError) as exc:  # e.g. a browser that does not trust the certificate yet
+                log.debug("https handshake with %s failed: %s", client_address[0], exc)
+                return
+            try:
+                self.RequestHandlerClass(request, client_address, self)
+            finally:
+                try:
+                    request.close()
+                except OSError:
+                    pass
+            return
+        self.RequestHandlerClass(request, client_address, self)
+
+
 def start_web(app: App):
     cfg = app.cfg
     if cfg.web_port == 0:
         return None
+    tls = tls_context(cfg)
     try:
-        server = ThreadingHTTPServer((cfg.web_host, cfg.web_port), make_handler(app))
+        server = WebServer((cfg.web_host, cfg.web_port), make_handler(app), tls)
     except OSError as exc:  # detection must keep working without the page
         log.error("web page not started on %s:%d: %s", cfg.web_host, cfg.web_port, exc)
         return None
     threading.Thread(target=server.serve_forever, name="web", daemon=True).start()
     shown = f"{socket.gethostname()}.local" if cfg.web_host in ("", "0.0.0.0") else cfg.web_host
-    log.info("web console on http://%s:%d/ (no login: keep it on a trusted network)", shown, cfg.web_port)
+    log.info("web console on %s://%s:%d/ (%s)", "https" if tls else "http", shown, cfg.web_port,
+             "login required" if cfg.login else "NO login: keep it on a trusted network")
+    if cfg.login and not app.store.users():
+        log.warning("there are no logins yet: create one with: sudo -u homesec homesec adduser YOURNAME")
     return server
 
 
@@ -2344,6 +2915,7 @@ def cmd_run(cfg: Config) -> int:
         mailer.close()
         if slack:
             slack.close()
+        app.store.close()
     return 0
 
 
@@ -2396,6 +2968,50 @@ def cmd_check(cfg: Config, image: Optional[str]) -> int:
     return 0
 
 
+def ask_password(name: str) -> str:
+    """Twice on a terminal; from standard input otherwise (one line), for scripts."""
+    if not sys.stdin.isatty():
+        password = sys.stdin.readline().rstrip("\n")
+    else:
+        password = getpass.getpass(f"Password for {name}: ")
+        if password != getpass.getpass("Again: "):
+            raise ConfigError("the two passwords are not the same")
+    if len(password) < 8:
+        raise ConfigError("use a password of at least 8 characters")
+    return password
+
+
+def cmd_users(cfg: Config, command: str, name: Optional[str], role: str) -> int:
+    store = Store(cfg.db_file)
+    try:
+        if command == "users":
+            users = store.users()
+            if not users:
+                print("no logins yet: homesec adduser NAME")
+            for u in users:
+                print(f"{u['name']:<20} {u['role']:<7} created {u['created_at']}   last login {u['last_login'] or 'never'}")
+            return 0
+        if not name:
+            raise ConfigError(f"give a user name: homesec {command} NAME")
+        if command == "adduser":
+            store.add_user(name, ask_password(name), role)
+            store.audit("adduser", name, "", role)
+            print(f"login {name} added ({role})")
+        elif command == "passwd":
+            if not store.set_password(name, ask_password(name)):
+                raise ConfigError(f"there is no user {name}")
+            store.audit("passwd", name)
+            print(f"password of {name} changed; its sessions are logged out")
+        elif command == "deluser":
+            if not store.delete_user(name):
+                raise ConfigError(f"there is no user {name}")
+            store.audit("deluser", name)
+            print(f"login {name} removed")
+        return 0
+    finally:
+        store.close()
+
+
 def cmd_mailtest(cfg: Config) -> int:
     msg = build_message(cfg, subject="homeSec test mail",
                         body=f"If you read this, homeSec on {socket.gethostname()} can send mail.")
@@ -2411,11 +3027,14 @@ def cmd_mailtest(cfg: Config) -> int:
 def main(argv: Optional[list] = None) -> int:
     parser = argparse.ArgumentParser(prog="homesec", description="Mail a picture when the camera sees movement.")
     parser.add_argument("command", nargs="?", default="run",
-                        choices=("run", "snapshot", "mailtest", "slacktest", "check"),
+                        choices=("run", "snapshot", "mailtest", "slacktest", "check", "adduser", "passwd", "deluser",
+                                 "users"),
                         help="run (default): watch, mail and post to Slack; snapshot: mail one picture now; "
                              "mailtest / slacktest: send a test mail / Slack message; "
                              "check IMAGE: run the person check on a picture")
-    parser.add_argument("image", nargs="?", help="picture for the check command")
+    parser.add_argument("image", nargs="?", help="picture for the check command; user name for adduser/passwd/deluser")
+    parser.add_argument("--role", choices=("admin", "viewer"), default="admin",
+                        help="for adduser: admin (everything) or viewer (watch only)")
     parser.add_argument("--env", metavar="FILE", help=f"settings file (default: first of $HOMESEC_ENV, ./.env, {DEFAULT_ENV_FILE})")
     parser.add_argument("-v", "--verbose", action="store_true", help="show debug messages")
     args = parser.parse_args(argv)
@@ -2429,6 +3048,8 @@ def main(argv: Optional[list] = None) -> int:
             logging.getLogger().setLevel(cfg.log_level.upper())
         if args.command == "check":
             return cmd_check(cfg, args.image)
+        if args.command in ("adduser", "passwd", "deluser", "users"):
+            return cmd_users(cfg, args.command, args.image, args.role)
         return {"run": cmd_run, "snapshot": cmd_snapshot, "mailtest": cmd_mailtest,
                 "slacktest": cmd_slacktest}[args.command](cfg)
     except ConfigError as exc:
