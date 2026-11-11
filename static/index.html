@@ -182,12 +182,24 @@
     <!-- 1. key figures -->
     <section id="stats-disk" class="panel stats-disk">
       <div class="disk-tile">
-        <h2>Disk free</h2>
-        <p class="disk-line"><span id="stats-free" class="big">—</span> <span id="stats-pct" class="muted"></span></p>
-        <div class="stats-bar" role="img" aria-label="Disk use">
-          <span id="sbar-jpg" class="k-jpg"></span><span id="sbar-gif" class="k-gif"></span><span id="sbar-mp4" class="k-mp4"></span><span id="sbar-other" class="k-other"></span>
+        <h2>This Pi <span id="sys-note" class="muted"></span></h2>
+        <div class="meters">
+          <span class="m-name">Disk</span>
+          <div class="stats-bar" role="img" aria-label="Disk use">
+            <span id="sbar-jpg" class="k-jpg"></span><span id="sbar-gif" class="k-gif"></span><span id="sbar-mp4" class="k-mp4"></span><span id="sbar-other" class="k-other"></span>
+          </div>
+          <span class="m-val"><b id="stats-free">—</b> free <span id="stats-pct" class="muted"></span></span>
+          <span></span>
+          <ul id="stats-legend" class="stats-legend m-legend"></ul>
+          <span class="m-name">CPU</span>
+          <div class="m-bar"><span id="cpu-bar"></span></div>
+          <span class="m-val"><b id="cpu-pct">—</b> <span id="cpu-extra" class="muted"></span></span>
+          <svg id="cpu-spark" class="m-spark" viewBox="0 0 120 20" preserveAspectRatio="none" aria-hidden="true"><polyline id="cpu-line" points=""/></svg>
+          <span class="m-name">RAM</span>
+          <div class="m-bar"><span id="ram-bar"></span></div>
+          <span class="m-val"><b id="ram-pct">—</b> <span id="ram-extra" class="muted"></span></span>
+          <svg id="ram-spark" class="m-spark" viewBox="0 0 120 20" preserveAspectRatio="none" aria-hidden="true"><polyline id="ram-line" points=""/></svg>
         </div>
-        <ul id="stats-legend" class="stats-legend"></ul>
       </div>
       <dl class="kpis">
         <div class="kpi"><dt>Full in</dt><dd id="kpi-full">—</dd><small>at this pace</small></div>

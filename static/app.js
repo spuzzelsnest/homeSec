@@ -1023,7 +1023,8 @@
       box.dataset.level = d.level;
       $('stats-free').textContent = size(d.free);
       const pct = (n) => (d.total ? (100 * n) / d.total : 0);
-      $('stats-pct').textContent = `${Math.round(pct(d.free))}% of ${size(d.total)}`;
+      $('stats-pct').textContent = `of ${size(d.total)}`;
+      $('stats-free').parentElement.title = `${Math.round(pct(d.free))}% free`;
       $('kpi-full').textContent = st.days_left == null ? '—' : st.days_left > 365 ? '> 1 year'
         : st.days_left < 1 ? '< 1 day' : `${Math.round(st.days_left)} days`;
       const f = d.files || {};
@@ -1056,6 +1057,7 @@
       $('kpi-log-sub').textContent = st.history_days ? `kept ${st.history_days} days` : 'kept forever';
     }
     if (st.events) renderEventStats(st.events);
+    renderSystem(st.system);
     // space per day
     const chart = $('chart');
     const labels = $('chart-labels');
@@ -1175,6 +1177,38 @@
 
   const openLog = () => { files.folder = 'deleted'; files.pick = null; location.hash = '#files'; };
   $('kpi-log').addEventListener('click', openLog);
+
+  // processor and memory: refreshed every few seconds while the Stats tab is open
+  function renderSystem(sys) {
+    if (!sys) return;
+    const meter = (id, value, warn, high) => {
+      const bar = $(`${id}-bar`);
+      bar.style.width = `${value == null ? 0 : Math.min(100, value)}%`;
+      bar.dataset.level = value == null ? '' : value >= high ? 'high' : value >= warn ? 'warn' : '';
+      $(`${id}-pct`).textContent = value == null ? '—' : `${Math.round(value)}%`;
+      const pts = (sys.history || []).filter((x) => x[id] != null);
+      const n = Math.max(pts.length - 1, 1);
+      $(`${id}-line`).setAttribute('points', pts.map((x, i) => `${((i / n) * 120).toFixed(1)},${(20 - (x[id] / 100) * 20).toFixed(1)}`).join(' '));
+    };
+    meter('cpu', sys.cpu, 70, 90);
+    meter('ram', sys.ram, 75, 90);
+    const cpu = [];
+    if (sys.temp != null) cpu.push(`${Math.round(sys.temp)}°C`);
+    if (sys.load) cpu.push(`load ${sys.load[0].toFixed(2)}`);
+    if (sys.homesec_cpu != null) cpu.push(`homeSec ${Math.round(sys.homesec_cpu)}%`);
+    $('cpu-extra').textContent = cpu.join(' · ');
+    $('ram-extra').textContent = sys.ram_total
+      ? `${size(sys.ram_used)} of ${size(sys.ram_total)}${sys.homesec_ram ? ` · homeSec ${size(sys.homesec_ram)}` : ''}` : '';
+    $('cpu-bar').parentElement.title = sys.cores ? `${sys.cores} cores` : '';
+    const span = sys.history && sys.history.length > 1 ? sys.history[sys.history.length - 1].t - sys.history[0].t : 0;
+    $('sys-note').textContent = span ? `· lines: last ${span >= 90 ? `${Math.round(span / 60)} min` : `${span} s`}` : '';
+    const hot = sys.temp != null && sys.temp >= 80;
+    $('cpu-extra').classList.toggle('hot', hot);
+  }
+  setInterval(async () => {
+    if (view !== 'stats' || document.hidden) return;
+    try { renderSystem(await getJSON('/api/system')); } catch (err) { /* next time */ }
+  }, 5000);
   $('kpi-log').addEventListener('keydown', (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); openLog(); } });
 
   // ---------- the tabs: #live, #files, #stats

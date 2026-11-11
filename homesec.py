@@ -2046,6 +2046,95 @@ class FrameHub:
             return self._seq, self._frame
 
 
+class SystemMonitor:
+    """Processor, memory and temperature of the Pi, sampled every few seconds in the background,
+    with the last ten minutes kept for the sparklines on the Stats tab. Reads /proc and /sys only."""
+
+    def __init__(self, every: float = 5.0, keep: int = 120, proc: str = "/proc", sys_dir: str = "/sys"):
+        self.every = every
+        self._proc = Path(proc)
+        self._sys = Path(sys_dir)
+        self._lock = threading.Lock()
+        self._history: deque = deque(maxlen=keep)
+        self._last: Optional[dict] = None
+        self._cpu_prev: Optional[tuple] = None
+        self._self_prev: Optional[tuple] = None
+        self._thread: Optional[threading.Thread] = None
+
+    def start(self) -> "SystemMonitor":
+        if self._thread is None:
+            self.sample()
+            self._thread = threading.Thread(target=self._run, name="sysmon", daemon=True)
+            self._thread.start()
+        return self
+
+    def _run(self) -> None:
+        while True:
+            time.sleep(self.every)
+            try:
+                self.sample()
+            except Exception as exc:  # never let the monitor take the service down
+                log.debug("system monitor: %s", exc)
+
+    def _read(self, *parts: str, base: Optional[Path] = None) -> str:
+        try:
+            return (base or self._proc).joinpath(*parts).read_text()
+        except OSError:
+            return ""
+
+    def sample(self) -> dict:
+        now = time.time()
+        out: dict = {"t": int(now), "cpu": None, "ram": None, "temp": None}
+        # processor: busy share of all cores since the last sample
+        line = self._read("stat").split("\n", 1)[0].split()
+        if line[:1] == ["cpu"]:
+            ticks = [int(x) for x in line[1:]]
+            idle = ticks[3] + (ticks[4] if len(ticks) > 4 else 0)
+            total = sum(ticks[:8])
+            if self._cpu_prev:
+                dt, di = total - self._cpu_prev[0], idle - self._cpu_prev[1]
+                if dt > 0:
+                    out["cpu"] = round(100 * (dt - di) / dt, 1)
+            self._cpu_prev = (total, idle)
+        # homeSec itself: its share of the whole machine, and its memory
+        fields = self._read("self", "stat").rsplit(")", 1)[-1].split()
+        if len(fields) > 13:
+            used = int(fields[11]) + int(fields[12])  # utime + stime, in clock ticks
+            if self._self_prev and now > self._self_prev[1]:
+                hz = os.sysconf("SC_CLK_TCK") if hasattr(os, "sysconf") else 100
+                share = (used - self._self_prev[0]) / hz / (now - self._self_prev[1]) / (os.cpu_count() or 1)
+                out["homesec_cpu"] = round(100 * share, 1)
+            self._self_prev = (used, now)
+        rss = re.search(r"VmRSS:\s+(\d+) kB", self._read("self", "status"))
+        if rss:
+            out["homesec_ram"] = int(rss.group(1)) * 1024
+        # memory: what is not available to new programs counts as used (cache does not)
+        mem = dict(re.findall(r"^(\w+):\s+(\d+) kB", self._read("meminfo"), re.M))
+        if "MemTotal" in mem and "MemAvailable" in mem:
+            total, avail = int(mem["MemTotal"]) * 1024, int(mem["MemAvailable"]) * 1024
+            out.update(ram_total=total, ram_used=total - avail, ram=round(100 * (total - avail) / total, 1))
+        temp = self._read("class", "thermal", "thermal_zone0", "temp", base=self._sys).strip()
+        if temp.lstrip("-").isdigit():
+            out["temp"] = round(int(temp) / 1000, 1)
+        try:
+            out["load"] = [round(x, 2) for x in os.getloadavg()]
+        except (OSError, AttributeError):
+            pass
+        out["cores"] = os.cpu_count()
+        with self._lock:
+            self._last = out
+            if out["cpu"] is not None or out["ram"] is not None:
+                self._history.append({"t": out["t"], "cpu": out["cpu"], "ram": out["ram"]})
+        return out
+
+    def snapshot(self) -> dict:
+        """The latest reading plus the history, for /api/system and the Stats tab."""
+        if self._thread is None and self._last is None:
+            self.sample()
+        with self._lock:
+            return {**(self._last or {}), "every": self.every, "history": list(self._history)}
+
+
 class App:
     """What the web console can see and change."""
 
@@ -2058,6 +2147,7 @@ class App:
         self._sync_lock = threading.Lock()
         self._reasons: dict = {}        # (folder, stem) -> why its files are being deleted
         self._pruned_at = float("-inf")
+        self.system = SystemMonitor()
         self._catalog: Optional[list] = None
         self.control = control
         self.backend = backend
@@ -2433,6 +2523,7 @@ class App:
             "history": self.store.history(),
             "events": self.store.event_stats(),
             "history_days": self.cfg.history_days,
+            "system": self.system.snapshot(),
         }
 
     def cleanup(self, action: str, before: str = "", by: str = "") -> dict:
@@ -2663,6 +2754,8 @@ def make_handler(app: App):
                 return self._json(app.files())
             if path == "/api/stats":
                 return self._json(app.stats())
+            if path == "/api/system":
+                return self._json(app.system.snapshot())
             if path.startswith("/rejected/"):
                 name = path[len("/rejected/"):]
                 if not EVENT_NAME.match(name):
@@ -2985,6 +3078,7 @@ def start_web(app: App):
         log.error("web page not started on %s:%d: %s", cfg.web_host, cfg.web_port, exc)
         return None
     threading.Thread(target=server.serve_forever, name="web", daemon=True).start()
+    app.system.start()  # CPU and memory for the Stats tab, also while nobody looks: the sparklines need it
     shown = f"{socket.gethostname()}.local" if cfg.web_host in ("", "0.0.0.0") else cfg.web_host
     log.info("web console on %s://%s:%d/ (%s)", "https" if tls else "http", shown, cfg.web_port,
              "login required" if cfg.login else "NO login: keep it on a trusted network")
